@@ -92,6 +92,8 @@ pub mod logger;
 pub mod mmds;
 /// PCI specific emulation code.
 pub mod pci;
+/// Deterministic replay support.
+pub mod replay;
 /// Save/restore utilities.
 pub mod persist;
 /// Resource store for configured microVM resources.
@@ -152,6 +154,7 @@ use crate::logger::{METRICS, MetricsError, error, info, warn};
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
+use crate::replay::ReplayController;
 use crate::resources::VmmConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
@@ -325,6 +328,8 @@ pub struct Vmm {
     uffd: Option<Uffd>,
     /// Handles to the vcpu threads with vcpu_fds inside them.
     pub vcpus_handles: Vec<VcpuHandle>,
+    /// Shared replay controller used by vCPUs to record trapped exits.
+    pub replay_controller: Arc<ReplayController>,
     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.
     vcpus_exit_evt: EventFd,
     // Device manager
@@ -484,6 +489,7 @@ impl Vmm {
 
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.vm.common.mmio_bus.clone());
+            vcpu.set_replay_controller(self.replay_controller.clone());
             #[cfg(target_arch = "x86_64")]
             vcpu.kvm_vcpu.set_pio_bus(self.vm.pio_bus.clone());
 

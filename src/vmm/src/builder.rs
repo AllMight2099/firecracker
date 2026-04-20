@@ -42,6 +42,7 @@ use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 use crate::persist::{MicrovmState, MicrovmStateError};
+use crate::replay::{ReplayController, ReplayMode};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
@@ -318,6 +319,7 @@ pub fn build_microvm_for_boot(
         vm,
         uffd: None,
         vcpus_handles: Vec::new(),
+        replay_controller: Arc::new(ReplayController::new(ReplayMode::Off)),
         vcpus_exit_evt,
         device_manager,
     };
@@ -520,6 +522,7 @@ pub fn build_microvm_from_snapshot(
         vm,
         uffd,
         vcpus_handles: Vec::new(),
+        replay_controller: Arc::new(ReplayController::new(ReplayMode::Off)),
         vcpus_exit_evt,
         device_manager,
     };
@@ -869,6 +872,7 @@ pub(crate) mod tests {
             vm: Arc::new(vm),
             uffd: None,
             vcpus_handles: Vec::new(),
+            replay_controller: Arc::new(ReplayController::new(ReplayMode::Off)),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
         }

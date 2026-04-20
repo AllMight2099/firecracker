@@ -24,6 +24,7 @@ use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
 use crate::logger::{IncMetric, METRICS};
+use crate::replay::{DetExitKind, ReplayController};
 use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
@@ -145,6 +146,11 @@ impl Vcpu {
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: Arc<Bus>) {
         self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Sets a replay controller for this vCPU.
+    pub fn set_replay_controller(&mut self, replay_controller: Arc<ReplayController>) {
+        self.kvm_vcpu.peripherals.replay_controller = Some(replay_controller);
     }
 
     /// Attaches the fields required for debugging
@@ -426,7 +432,14 @@ fn handle_kvm_exit(
                     if let Err(err) = mmio_bus.read(addr, data) {
                         warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
                     }
+                    if let Some(replay_controller) = &peripherals.replay_controller {
+                        replay_controller.record(DetExitKind::MmioRead, addr, data);
+                    }
                     METRICS.vcpu.exit_mmio_read.inc();
+                    // debug!(
+                    //     "[DET] MMIO Read exit: count: {}",
+                    //     METRICS.vcpu.exit_mmio_read.count()
+                    // );
                 }
                 Ok(VcpuEmulation::Handled)
             }
@@ -434,9 +447,16 @@ fn handle_kvm_exit(
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
                     let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
                     if let Err(err) = mmio_bus.write(addr, data) {
-                        warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
+                        warn!("Invalid MMIO write @ {addr:#x}:{:#x}: {err}", data.len());
+                    }
+                    if let Some(replay_controller) = &peripherals.replay_controller {
+                        replay_controller.record(DetExitKind::MmioWrite, addr, data);
                     }
                     METRICS.vcpu.exit_mmio_write.inc();
+                    // debug!(
+                    //     "[DET] MMIO Write exit: count: {}",
+                    //     METRICS.vcpu.exit_mmio_write.count()
+                    // );
                 }
                 Ok(VcpuEmulation::Handled)
             }
@@ -674,6 +694,7 @@ pub(crate) mod tests {
     use crate::vstate::vcpu::VcpuError as EmulationError;
     use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+    use crate::replay::{DetExitKind, ReplayController, ReplayMode};
 
     struct DummyDevice;
 
@@ -802,6 +823,38 @@ pub(crate) mod tests {
             Ok(VcpuExit::MmioWrite(addr, &[0, 0, 0, 0])),
         );
         assert_eq!(res.unwrap(), VcpuEmulation::Handled);
+    }
+
+    #[test]
+    fn test_handle_kvm_exit_records_mmio_events() {
+        let (_, _, mut vcpu) = setup_vcpu(0x1000);
+        let bus = Arc::new(Bus::new());
+        let dummy = Arc::new(Mutex::new(DummyDevice));
+        let replay_controller = Arc::new(ReplayController::new(ReplayMode::Record));
+        bus.insert(dummy, 0x10, 0x10).unwrap();
+        vcpu.set_mmio_bus(bus);
+        vcpu.set_replay_controller(replay_controller.clone());
+
+        let mut read_data = [0_u8; 4];
+        handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::MmioRead(0x10, &mut read_data)),
+        )
+        .unwrap();
+        handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::MmioWrite(0x10, &[1, 2, 3, 4])),
+        )
+        .unwrap();
+
+        let events = replay_controller.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seqno, 0);
+        assert_eq!(events[0].kind, DetExitKind::MmioRead);
+        assert_eq!(events[0].addr, 0x10);
+        assert_eq!(events[1].seqno, 1);
+        assert_eq!(events[1].kind, DetExitKind::MmioWrite);
+        assert_eq!(events[1].data, vec![1, 2, 3, 4]);
     }
 
     impl PartialEq for VcpuResponse {

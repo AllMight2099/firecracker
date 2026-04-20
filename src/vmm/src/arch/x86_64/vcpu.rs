@@ -25,6 +25,7 @@ use crate::arch::x86_64::msr::{MsrError, create_boot_msr_entries};
 use crate::arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
 use crate::cpu_config::x86_64::{CpuConfiguration, cpuid};
 use crate::logger::{IncMetric, METRICS};
+use crate::replay::{DetExitKind, ReplayController};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vcpu::{VcpuConfig, VcpuEmulation, VcpuError};
@@ -164,6 +165,8 @@ pub struct Peripherals {
     pub pio_bus: Option<Arc<Bus>>,
     /// Mmio bus.
     pub mmio_bus: Option<Arc<Bus>>,
+    /// Shared replay controller used to record trapped exits.
+    pub replay_controller: Option<Arc<ReplayController>>,
 }
 
 impl KvmVcpu {
@@ -731,7 +734,11 @@ impl Peripherals {
                     if let Err(err) = pio_bus.read(u64::from(addr), data) {
                         warn!("vcpu: IO read @ {addr:#x}:{:#x} failed: {err}", data.len());
                     }
+                    if let Some(replay_controller) = &self.replay_controller {
+                        replay_controller.record(DetExitKind::IoIn, u64::from(addr), data);
+                    }
                     METRICS.vcpu.exit_io_in.inc();
+                    // debug!("vcpu IO in, count: {}", METRICS.vcpu.exit_io_in.count());
                 }
                 Ok(VcpuEmulation::Handled)
             }
@@ -741,7 +748,11 @@ impl Peripherals {
                     if let Err(err) = pio_bus.write(u64::from(addr), data) {
                         warn!("vcpu: IO write @ {addr:#x}:{:#x} failed: {err}", data.len());
                     }
+                    if let Some(replay_controller) = &self.replay_controller {
+                        replay_controller.record(DetExitKind::IoOut, u64::from(addr), data);
+                    }
                     METRICS.vcpu.exit_io_out.inc();
+                    // debug!("vcpu IO out, count: {}", METRICS.vcpu.exit_io_out.count());
                 }
                 Ok(VcpuEmulation::Handled)
             }
@@ -811,6 +822,8 @@ impl Debug for VcpuState {
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
+    use std::sync::{Arc, Barrier, Mutex};
+
     use kvm_bindings::kvm_msr_entry;
     use kvm_ioctls::Cap;
     use vm_memory::GuestAddress;
@@ -823,9 +836,21 @@ mod tests {
         StaticCpuTemplate,
     };
     use crate::cpu_config::x86_64::cpuid::{Cpuid, CpuidEntry, CpuidKey};
+    use crate::replay::{DetExitKind, ReplayController, ReplayMode};
+    use crate::vstate::bus::{Bus, BusDevice};
     use crate::vstate::kvm::Kvm;
     use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::{setup_vm, setup_vm_with_memory};
+
+    struct DummyDevice;
+
+    impl BusDevice for DummyDevice {
+        fn read(&mut self, _base: u64, _offset: u64, _data: &mut [u8]) {}
+
+        fn write(&mut self, _base: u64, _offset: u64, _data: &[u8]) -> Option<Arc<Barrier>> {
+            None
+        }
+    }
 
     impl Default for VcpuState {
         fn default() -> Self {
@@ -973,6 +998,34 @@ mod tests {
                 assert!(!t2a_res);
             }
         }
+    }
+
+    #[test]
+    fn test_run_arch_emulation_records_pio_events() {
+        let (_, _, mut vcpu) = setup_vcpu(0x10000);
+        let bus = Arc::new(Bus::new());
+        let dummy = Arc::new(Mutex::new(DummyDevice));
+        let replay_controller = Arc::new(ReplayController::new(ReplayMode::Record));
+        bus.insert(dummy, 0x10, 0x10).unwrap();
+        vcpu.peripherals.pio_bus = Some(bus);
+        vcpu.peripherals.replay_controller = Some(replay_controller.clone());
+
+        let mut read_data = [0_u8; 2];
+        vcpu.peripherals
+            .run_arch_emulation(VcpuExit::IoIn(0x10, &mut read_data))
+            .unwrap();
+        vcpu.peripherals
+            .run_arch_emulation(VcpuExit::IoOut(0x10, &[5, 6]))
+            .unwrap();
+
+        let events = replay_controller.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seqno, 0);
+        assert_eq!(events[0].kind, DetExitKind::IoIn);
+        assert_eq!(events[0].addr, 0x10);
+        assert_eq!(events[1].seqno, 1);
+        assert_eq!(events[1].kind, DetExitKind::IoOut);
+        assert_eq!(events[1].data, vec![5, 6]);
     }
 
     #[test]
