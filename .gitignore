@@ -18,4 +18,4 @@ tags
 /resources/x86_64
 /resources/aarch64
 *.log
-tmp
+# tmp
