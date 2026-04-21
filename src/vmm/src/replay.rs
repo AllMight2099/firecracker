@@ -6,6 +6,8 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::logger::{IncMetric, METRICS};
+
 const REPLAY_LOG_MAGIC: [u8; 4] = *b"DET0";
 const REPLAY_LOG_VERSION: u16 = 1;
 
@@ -191,6 +193,7 @@ impl ReplayController {
                 size: data.len().try_into().unwrap_or(u32::MAX),
                 data: data.to_vec(),
             });
+        METRICS.replay.events_recorded.inc();
     }
 
     /// Return a snapshot of the recorded event log.
@@ -292,11 +295,13 @@ impl ReplayController {
     ) -> Result<(), ReplayDivergence> {
         let seqno = self.replay_cursor.fetch_add(1, Ordering::SeqCst);
         let events = self.events.lock().expect("Replay events lock poisoned");
-        let expected = events
-            .get(seqno as usize)
-            .ok_or(ReplayDivergence::LogExhausted { seqno })?;
+        let expected = events.get(seqno as usize).ok_or_else(|| {
+            METRICS.replay.divergences.inc();
+            ReplayDivergence::LogExhausted { seqno }
+        })?;
 
         if expected.kind != kind || expected.addr != addr {
+            METRICS.replay.divergences.inc();
             return Err(ReplayDivergence::KindOrAddrMismatch {
                 seqno,
                 expected_kind: expected.kind,
@@ -308,6 +313,7 @@ impl ReplayController {
 
         let actual_size = data.len() as u32;
         if expected.size != actual_size {
+            METRICS.replay.divergences.inc();
             return Err(ReplayDivergence::SizeMismatch {
                 seqno,
                 expected_size: expected.size,
@@ -316,6 +322,7 @@ impl ReplayController {
         }
 
         data.copy_from_slice(&expected.data);
+        METRICS.replay.events_replayed.inc();
         Ok(())
     }
 
@@ -331,11 +338,13 @@ impl ReplayController {
     ) -> Result<(), ReplayDivergence> {
         let seqno = self.replay_cursor.fetch_add(1, Ordering::SeqCst);
         let events = self.events.lock().expect("Replay events lock poisoned");
-        let expected = events
-            .get(seqno as usize)
-            .ok_or(ReplayDivergence::LogExhausted { seqno })?;
+        let expected = events.get(seqno as usize).ok_or_else(|| {
+            METRICS.replay.divergences.inc();
+            ReplayDivergence::LogExhausted { seqno }
+        })?;
 
         if expected.kind != kind || expected.addr != addr {
+            METRICS.replay.divergences.inc();
             return Err(ReplayDivergence::KindOrAddrMismatch {
                 seqno,
                 expected_kind: expected.kind,
@@ -346,9 +355,11 @@ impl ReplayController {
         }
 
         if expected.data.as_slice() != data {
+            METRICS.replay.divergences.inc();
             return Err(ReplayDivergence::WriteDataMismatch { seqno, addr });
         }
 
+        METRICS.replay.events_replayed.inc();
         Ok(())
     }
 }

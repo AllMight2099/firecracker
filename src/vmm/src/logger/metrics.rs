@@ -696,6 +696,27 @@ impl SignalMetrics {
     }
 }
 
+/// Metrics for the deterministic replay prototype.
+#[derive(Debug, Default, Serialize)]
+pub struct ReplayMetrics {
+    /// Number of trapped exits appended to the replay log.
+    pub events_recorded: SharedIncMetric,
+    /// Number of trapped exits consumed from the replay log.
+    pub events_replayed: SharedIncMetric,
+    /// Number of times a replayed exit diverged from the recorded stream.
+    pub divergences: SharedIncMetric,
+}
+impl ReplayMetrics {
+    /// Const default construction.
+    pub const fn new() -> Self {
+        Self {
+            events_recorded: SharedIncMetric::new(),
+            events_replayed: SharedIncMetric::new(),
+            divergences: SharedIncMetric::new(),
+        }
+    }
+}
+
 /// Provides efficient way to record LatencyAggregateMetrics
 #[derive(Debug)]
 pub struct LatencyMetricsRecorder<'a> {
@@ -948,6 +969,8 @@ pub struct FirecrackerMetrics {
     pub vhost_user_ser: VhostUserMetricsSerializeProxy,
     /// Interrupt related metrics
     pub interrupts: InterruptMetrics,
+    /// Deterministic replay related metrics.
+    pub replay: ReplayMetrics,
     #[serde(flatten)]
     /// Virtio-mem device related metrics (memory hotplugging)
     pub memory_hotplug_ser: MemoryHotplugSerializeProxy,
@@ -978,6 +1001,7 @@ impl FirecrackerMetrics {
             pmem_ser: PmemMetricsSerializeProxy {},
             vhost_user_ser: VhostUserMetricsSerializeProxy {},
             interrupts: InterruptMetrics::new(),
+            replay: ReplayMetrics::new(),
             memory_hotplug_ser: MemoryHotplugSerializeProxy {},
         }
     }
