@@ -24,7 +24,7 @@ use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
 #[cfg(feature = "gdb")]
 use crate::gdb::target::{GdbTargetError, get_raw_tid};
 use crate::logger::{IncMetric, METRICS};
-use crate::replay::{DetExitKind, ReplayController};
+use crate::replay::{DetExitKind, ReplayController, ReplayDivergence, ReplayMode};
 use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
@@ -51,6 +51,8 @@ pub enum VcpuError {
     VcpuSpawn(io::Error),
     /// Vcpu not present in TLS
     VcpuTlsNotPresent,
+    /// Deterministic replay divergence detected: {0}
+    ReplayDivergence(ReplayDivergence),
     /// Error with gdb request sent
     #[cfg(feature = "gdb")]
     GdbRequest(GdbTargetError),
@@ -429,34 +431,61 @@ fn handle_kvm_exit(
                 data.fill(0);
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
                     let _metric = METRICS.vcpu.exit_mmio_read_agg.record_latency_metrics();
-                    if let Err(err) = mmio_bus.read(addr, data) {
-                        warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
-                    }
-                    if let Some(replay_controller) = &peripherals.replay_controller {
-                        replay_controller.record(DetExitKind::MmioRead, addr, data);
+                    match peripherals
+                        .replay_controller
+                        .as_ref()
+                        .map(|rc| rc.mode())
+                        .unwrap_or(ReplayMode::Off)
+                    {
+                        ReplayMode::Replay => {
+                            peripherals
+                                .replay_controller
+                                .as_ref()
+                                .unwrap()
+                                .consume_read(DetExitKind::MmioRead, addr, data)
+                                .map_err(VcpuError::ReplayDivergence)?;
+                        }
+                        ReplayMode::Record => {
+                            if let Err(err) = mmio_bus.read(addr, data) {
+                                warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
+                            }
+                            peripherals
+                                .replay_controller
+                                .as_ref()
+                                .unwrap()
+                                .record(DetExitKind::MmioRead, addr, data);
+                        }
+                        ReplayMode::Off => {
+                            if let Err(err) = mmio_bus.read(addr, data) {
+                                warn!("Invalid MMIO read @ {addr:#x}:{:#x}: {err}", data.len());
+                            }
+                        }
                     }
                     METRICS.vcpu.exit_mmio_read.inc();
-                    // debug!(
-                    //     "[DET] MMIO Read exit: count: {}",
-                    //     METRICS.vcpu.exit_mmio_read.count()
-                    // );
                 }
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExit::MmioWrite(addr, data) => {
                 if let Some(mmio_bus) = &peripherals.mmio_bus {
                     let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
+                    if let Some(rc) = &peripherals.replay_controller {
+                        match rc.mode() {
+                            ReplayMode::Replay => {
+                                rc.validate_write(DetExitKind::MmioWrite, addr, data)
+                                    .map_err(VcpuError::ReplayDivergence)?;
+                            }
+                            ReplayMode::Record | ReplayMode::Off => {}
+                        }
+                    }
                     if let Err(err) = mmio_bus.write(addr, data) {
                         warn!("Invalid MMIO write @ {addr:#x}:{:#x}: {err}", data.len());
                     }
-                    if let Some(replay_controller) = &peripherals.replay_controller {
-                        replay_controller.record(DetExitKind::MmioWrite, addr, data);
+                    if let Some(rc) = &peripherals.replay_controller {
+                        if rc.mode() == ReplayMode::Record {
+                            rc.record(DetExitKind::MmioWrite, addr, data);
+                        }
                     }
                     METRICS.vcpu.exit_mmio_write.inc();
-                    // debug!(
-                    //     "[DET] MMIO Write exit: count: {}",
-                    //     METRICS.vcpu.exit_mmio_write.count()
-                    // );
                 }
                 Ok(VcpuEmulation::Handled)
             }

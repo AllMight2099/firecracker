@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{self, Debug};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
@@ -9,6 +10,7 @@ use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
 use super::persist::{create_snapshot, restore_from_snapshot};
+use super::replay::ReplayMode;
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -146,6 +148,16 @@ pub enum VmmAction {
     /// Update the microVM configuration (memory & vcpu) using `VmUpdateConfig` as input. This
     /// action can only be called before the microVM has booted.
     UpdateMachineConfiguration(MachineConfigUpdate),
+    /// Set the deterministic replay mode on the running microVM.
+    SetReplayMode(ReplayMode),
+    /// Get the current deterministic replay mode.
+    GetReplayMode,
+    /// Reset the replay event log and the replay logical clock.
+    ResetReplayLog,
+    /// Save the replay event log to a sidecar file at the given path.
+    SaveReplayLog(PathBuf),
+    /// Load the replay event log from a sidecar file at the given path.
+    LoadReplayLog(PathBuf),
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -228,6 +240,8 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
+    /// The current deterministic replay mode.
+    ReplayMode(ReplayMode),
 }
 
 fn mmds_patch_data(
@@ -495,7 +509,12 @@ impl<'a> PrebootApiController<'a> {
             | UpdateNetworkInterface(_)
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
-            | StopFreePageHinting => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | StopFreePageHinting
+            | SetReplayMode(_)
+            | GetReplayMode
+            | ResetReplayLog
+            | SaveReplayLog(_)
+            | LoadReplayLog(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -795,6 +814,31 @@ impl RuntimeApiController {
                 .update_memory_hotplug_size(cfg.requested_size_mib)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::MemoryHotplugUpdate),
+            SetReplayMode(mode) => {
+                self.vmm.lock().expect("Poisoned lock").set_replay_mode(mode);
+                Ok(VmmData::Empty)
+            }
+            GetReplayMode => Ok(VmmData::ReplayMode(
+                self.vmm.lock().expect("Poisoned lock").replay_mode(),
+            )),
+            ResetReplayLog => {
+                self.vmm.lock().expect("Poisoned lock").reset_replay_log();
+                Ok(VmmData::Empty)
+            }
+            SaveReplayLog(path) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .save_replay_log(&path)
+                .map(|()| VmmData::Empty)
+                .map_err(VmmActionError::InternalVmm),
+            LoadReplayLog(path) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .load_replay_log(&path)
+                .map(|()| VmmData::Empty)
+                .map_err(VmmActionError::InternalVmm),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
