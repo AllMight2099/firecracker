@@ -25,6 +25,7 @@ use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::parse_put_pmem;
+use super::request::replay::{parse_get_replay, parse_put_replay};
 use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
@@ -91,6 +92,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
                 parse_get_memory_hotplug()
             }
+            (Method::Get, "replay", None) => parse_get_replay(path_tokens.next()),
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
@@ -106,6 +108,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "network-interfaces", Some(body)) => {
                 parse_put_net(body, path_tokens.next())
             }
+            (Method::Put, "replay", Some(body)) => parse_put_replay(body, path_tokens.next()),
             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
@@ -196,6 +199,9 @@ impl ParsedRequest {
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+                VmmData::ReplayMode(mode) => {
+                    Self::success_response_with_data(&serde_json::json!({ "mode": mode }))
+                }
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {
@@ -608,6 +614,10 @@ pub mod tests {
                 }
                 VmmData::VmmVersion(version) => http_response(
                     &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
+                    200,
+                ),
+                VmmData::ReplayMode(mode) => http_response(
+                    &serde_json::json!({ "mode": mode }).to_string(),
                     200,
                 ),
             };

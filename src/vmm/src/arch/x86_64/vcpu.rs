@@ -25,7 +25,7 @@ use crate::arch::x86_64::msr::{MsrError, create_boot_msr_entries};
 use crate::arch::x86_64::regs::{SetupFpuError, SetupRegistersError, SetupSpecialRegistersError};
 use crate::cpu_config::x86_64::{CpuConfiguration, cpuid};
 use crate::logger::{IncMetric, METRICS};
-use crate::replay::{DetExitKind, ReplayController};
+use crate::replay::{DetExitKind, ReplayController, ReplayMode};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vcpu::{VcpuConfig, VcpuEmulation, VcpuError};
@@ -731,28 +731,65 @@ impl Peripherals {
                 data.fill(0);
                 if let Some(pio_bus) = &self.pio_bus {
                     let _metric = METRICS.vcpu.exit_io_in_agg.record_latency_metrics();
-                    if let Err(err) = pio_bus.read(u64::from(addr), data) {
-                        warn!("vcpu: IO read @ {addr:#x}:{:#x} failed: {err}", data.len());
-                    }
-                    if let Some(replay_controller) = &self.replay_controller {
-                        replay_controller.record(DetExitKind::IoIn, u64::from(addr), data);
+                    match self
+                        .replay_controller
+                        .as_ref()
+                        .map(|rc| rc.mode())
+                        .unwrap_or(ReplayMode::Off)
+                    {
+                        ReplayMode::Replay => {
+                            self.replay_controller
+                                .as_ref()
+                                .unwrap()
+                                .consume_read(DetExitKind::IoIn, u64::from(addr), data)
+                                .map_err(VcpuError::ReplayDivergence)?;
+                        }
+                        ReplayMode::Record => {
+                            if let Err(err) = pio_bus.read(u64::from(addr), data) {
+                                warn!(
+                                    "vcpu: IO read @ {addr:#x}:{:#x} failed: {err}",
+                                    data.len()
+                                );
+                            }
+                            self.replay_controller
+                                .as_ref()
+                                .unwrap()
+                                .record(DetExitKind::IoIn, u64::from(addr), data);
+                        }
+                        ReplayMode::Off => {
+                            if let Err(err) = pio_bus.read(u64::from(addr), data) {
+                                warn!(
+                                    "vcpu: IO read @ {addr:#x}:{:#x} failed: {err}",
+                                    data.len()
+                                );
+                            }
+                        }
                     }
                     METRICS.vcpu.exit_io_in.inc();
-                    // debug!("vcpu IO in, count: {}", METRICS.vcpu.exit_io_in.count());
                 }
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExit::IoOut(addr, data) => {
                 if let Some(pio_bus) = &self.pio_bus {
                     let _metric = METRICS.vcpu.exit_io_out_agg.record_latency_metrics();
+                    if let Some(rc) = &self.replay_controller {
+                        match rc.mode() {
+                            ReplayMode::Replay => {
+                                rc.validate_write(DetExitKind::IoOut, u64::from(addr), data)
+                                    .map_err(VcpuError::ReplayDivergence)?;
+                            }
+                            ReplayMode::Record | ReplayMode::Off => {}
+                        }
+                    }
                     if let Err(err) = pio_bus.write(u64::from(addr), data) {
                         warn!("vcpu: IO write @ {addr:#x}:{:#x} failed: {err}", data.len());
                     }
-                    if let Some(replay_controller) = &self.replay_controller {
-                        replay_controller.record(DetExitKind::IoOut, u64::from(addr), data);
+                    if let Some(rc) = &self.replay_controller {
+                        if rc.mode() == ReplayMode::Record {
+                            rc.record(DetExitKind::IoOut, u64::from(addr), data);
+                        }
                     }
                     METRICS.vcpu.exit_io_out.inc();
-                    // debug!("vcpu IO out, count: {}", METRICS.vcpu.exit_io_out.count());
                 }
                 Ok(VcpuEmulation::Handled)
             }

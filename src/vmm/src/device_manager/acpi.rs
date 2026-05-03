@@ -1,12 +1,15 @@
 // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 #[cfg(target_arch = "x86_64")]
 use acpi_tables::{Aml, aml};
 
 use crate::Vm;
 use crate::devices::acpi::vmclock::{VmClock, VmClockError};
 use crate::devices::acpi::vmgenid::{VmGenId, VmGenIdError};
+use crate::replay::ReplayController;
 use crate::vstate::memory::GuestMemoryMmap;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -27,6 +30,12 @@ pub struct ACPIDeviceManager {
     vmgenid: Option<VmGenId>,
     /// VMclock device
     vmclock: Option<VmClock>,
+}
+
+#[derive(Debug)]
+pub struct ACPIDeviceManagerConstructorArgs<'a> {
+    pub vm: &'a Vm,
+    pub replay_controller: Option<&'a Arc<ReplayController>>,
 }
 
 impl ACPIDeviceManager {
@@ -76,11 +85,12 @@ impl ACPIDeviceManager {
     pub fn do_post_restore_vmclock(
         &mut self,
         mem: &GuestMemoryMmap,
+        replay_controller: Option<&Arc<ReplayController>>,
     ) -> Result<(), ACPIDeviceError> {
         self.vmclock
             .as_mut()
             .expect("Missing VMClock device")
-            .do_post_restore(mem)?;
+            .do_post_restore(mem, replay_controller.map(Arc::as_ref))?;
         Ok(())
     }
 }

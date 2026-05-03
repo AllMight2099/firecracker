@@ -466,6 +466,8 @@ pub fn restore_from_snapshot(
         uffd,
         seccomp_filters,
         vm_resources,
+        params.replay_mode,
+        params.replay_log_path.as_deref(),
     )
     .map_err(RestoreFromSnapshotError::Build)
 }

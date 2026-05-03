@@ -8,6 +8,7 @@ use std::io;
 #[cfg(feature = "gdb")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::{fs::File, path::Path};
 
 use event_manager::SubscriberOps;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
@@ -42,7 +43,7 @@ use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 use crate::persist::{MicrovmState, MicrovmStateError};
-use crate::replay::{ReplayController, ReplayMode};
+use crate::replay::{ReplayController, ReplayLogError, ReplayMode};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
@@ -323,6 +324,7 @@ pub fn build_microvm_for_boot(
         vcpus_exit_evt,
         device_manager,
     };
+    crate::replay::register_global_replay_controller(Some(&vmm.replay_controller));
     let vmm = Arc::new(Mutex::new(vmm));
 
     #[cfg(feature = "gdb")]
@@ -427,6 +429,12 @@ pub enum BuildMicrovmFromSnapshotError {
     SeccompFiltersInternal(#[from] crate::seccomp::InstallationError),
     /// Failed to restore devices: {0}
     RestoreDevices(#[from] DeviceManagerPersistError),
+    /// Missing replay log path for replay-mode snapshot restore.
+    MissingReplayLogPath,
+    /// Failed to open replay log: {0}
+    ReplayLogIo(#[from] std::io::Error),
+    /// Failed to load replay log: {0}
+    ReplayLog(#[from] ReplayLogError),
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
@@ -442,6 +450,8 @@ pub fn build_microvm_from_snapshot(
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
+    replay_mode: ReplayMode,
+    replay_log_path: Option<&Path>,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -496,6 +506,14 @@ pub fn build_microvm_from_snapshot(
     vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
 
     let vm = Arc::new(vm);
+    let replay_controller = Arc::new(ReplayController::new(replay_mode));
+    crate::replay::register_global_replay_controller(Some(&replay_controller));
+    if replay_mode == ReplayMode::Replay {
+        let replay_log_path =
+            replay_log_path.ok_or(BuildMicrovmFromSnapshotError::MissingReplayLogPath)?;
+        let mut replay_log = File::open(replay_log_path)?;
+        replay_controller.load_from_reader(&mut replay_log)?;
+    }
 
     // Restore devices states.
     // Restoring VMGenID injects an interrupt in the guest to notify it about the new generation
@@ -504,6 +522,7 @@ pub fn build_microvm_from_snapshot(
     let device_ctor_args = DeviceRestoreArgs {
         mem: vm.guest_memory(),
         vm: &vm,
+        replay_controller: &replay_controller,
         event_manager,
         vm_resources,
         instance_id: &instance_info.id,
@@ -522,7 +541,7 @@ pub fn build_microvm_from_snapshot(
         vm,
         uffd,
         vcpus_handles: Vec::new(),
-        replay_controller: Arc::new(ReplayController::new(ReplayMode::Off)),
+        replay_controller,
         vcpus_exit_evt,
         device_manager,
     };

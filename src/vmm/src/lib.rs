@@ -119,8 +119,10 @@ pub mod vstate;
 pub mod initrd;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
@@ -154,7 +156,7 @@ use crate::logger::{METRICS, MetricsError, error, info, warn};
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
-use crate::replay::ReplayController;
+use crate::replay::{ReplayController, ReplayLogError, ReplayMode};
 use crate::resources::VmmConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
@@ -242,6 +244,8 @@ pub enum VmmError {
     SeccompFilters(seccomp::InstallationError),
     /// Error writing to the serial console: {0}
     Serial(io::Error),
+    /// Replay log I/O failure: {0}
+    ReplayLogIo(io::Error),
     /// Error creating the vcpu: {0}
     VcpuCreate(vstate::vcpu::VcpuError),
     /// Cannot send event to vCPU. {0}
@@ -272,6 +276,8 @@ pub enum VmmError {
     Balloon(#[from] BalloonError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// Replay log failure: {0}
+    ReplayLog(#[from] ReplayLogError),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -366,6 +372,35 @@ impl Vmm {
     /// Provides the Vmm shutdown exit code if there is one.
     pub fn shutdown_exit_code(&self) -> Option<FcExitCode> {
         self.shutdown_exit_code
+    }
+
+    /// Returns the current deterministic replay mode.
+    pub fn replay_mode(&self) -> ReplayMode {
+        self.replay_controller.mode()
+    }
+
+    /// Sets the deterministic replay mode.
+    pub fn set_replay_mode(&self, mode: ReplayMode) {
+        self.replay_controller.set_mode(mode);
+    }
+
+    /// Clears all currently recorded replay events and resets the logical clock.
+    pub fn reset_replay_log(&self) {
+        self.replay_controller.reset();
+    }
+
+    /// Saves the current replay log to a sidecar file.
+    pub fn save_replay_log<P: AsRef<Path>>(&self, path: P) -> Result<(), VmmError> {
+        let mut file = File::create(path).map_err(VmmError::ReplayLogIo)?;
+        self.replay_controller.save_to_writer(&mut file)?;
+        Ok(())
+    }
+
+    /// Loads a replay log from a sidecar file.
+    pub fn load_replay_log<P: AsRef<Path>>(&self, path: P) -> Result<(), VmmError> {
+        let mut file = File::open(path).map_err(VmmError::ReplayLogIo)?;
+        self.replay_controller.load_from_reader(&mut file)?;
+        Ok(())
     }
 
     /// Builds a FullVmConfig from the current Vmm state.

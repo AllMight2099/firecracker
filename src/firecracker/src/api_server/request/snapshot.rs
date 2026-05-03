@@ -111,6 +111,8 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
+        replay_mode: snapshot_config.replay_mode,
+        replay_log_path: snapshot_config.replay_log_path,
     };
 
     // Construct the `ParsedRequest` object.
@@ -189,6 +191,8 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            replay_mode: vmm::replay::ReplayMode::Off,
+            replay_log_path: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -220,6 +224,8 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            replay_mode: vmm::replay::ReplayMode::Off,
+            replay_log_path: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -251,6 +257,8 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            replay_mode: vmm::replay::ReplayMode::Off,
+            replay_log_path: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -291,6 +299,8 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             vsock_override: None,
+            replay_mode: vmm::replay::ReplayMode::Off,
+            replay_log_path: None,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -319,6 +329,8 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            replay_mode: vmm::replay::ReplayMode::Off,
+            replay_log_path: None,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(
