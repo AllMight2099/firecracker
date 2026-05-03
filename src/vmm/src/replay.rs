@@ -3,13 +3,62 @@
 //! Deterministic replay primitives.
 
 use std::io::{self, Read, Write};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::logger::{IncMetric, METRICS};
 
 const REPLAY_LOG_MAGIC: [u8; 4] = *b"DET0";
 const REPLAY_LOG_VERSION: u16 = 1;
+
+/// Source tag for an `IrqInjection` event: legacy / ACPI device path
+/// (`EventFdTrigger::trigger`).
+pub const IRQ_SOURCE_LEGACY: u8 = 0;
+/// Source tag for an `IrqInjection` event: virtio config-change interrupt.
+pub const IRQ_SOURCE_VIRTIO_CONFIG: u8 = 1;
+/// Source tag for an `IrqInjection` event: virtio used-ring interrupt.
+pub const IRQ_SOURCE_VIRTIO_VRING: u8 = 2;
+
+/// Process-wide registry holding a `Weak<ReplayController>` so device-level
+/// IRQ trigger paths can record observability events without each device
+/// owning a controller reference.
+///
+/// This is a prototype simplification: the proper fix is to thread the
+/// controller through every device's construction. We accept the global for
+/// now because (a) IRQ observability is record-only diagnostic data, (b)
+/// replay-aware Firecracker is single-vmm-per-process, and (c) the registry
+/// holds a `Weak` so it cannot extend the controller's lifetime.
+static GLOBAL_REPLAY_CONTROLLER: OnceLock<Mutex<Option<Weak<ReplayController>>>> =
+    OnceLock::new();
+
+fn global_slot() -> &'static Mutex<Option<Weak<ReplayController>>> {
+    GLOBAL_REPLAY_CONTROLLER.get_or_init(|| Mutex::new(None))
+}
+
+/// Register `controller` as the process-wide replay controller for IRQ
+/// observability. Subsequent `record_irq_via_global` calls will record
+/// against it for as long as it remains live.
+///
+/// Setting twice (e.g. across snapshot restores) is allowed; the last
+/// registration wins. Pass `None` to clear.
+pub fn register_global_replay_controller(controller: Option<&Arc<ReplayController>>) {
+    let mut slot = global_slot().lock().expect("global replay controller lock poisoned");
+    *slot = controller.map(Arc::downgrade);
+}
+
+/// Record an IRQ injection through the global replay controller, if one is
+/// registered and still live. No-op otherwise. Intended to be called from
+/// device IRQ trigger paths.
+pub fn record_irq_via_global(source_tag: u8, payload: u32) {
+    let weak = {
+        let slot = global_slot().lock().expect("global replay controller lock poisoned");
+        slot.clone()
+    };
+    if let Some(rc) = weak.and_then(|w| w.upgrade()) {
+        rc.record_irq(source_tag, payload);
+    }
+}
 
 /// Execution mode for deterministic replay support.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -34,6 +83,18 @@ pub enum DetExitKind {
     IoIn,
     /// PIO output exit.
     IoOut,
+    /// Guest-visible VMClock state update.
+    VmClockState,
+    /// Guest TSC read event (rdmsr MSR_IA32_TSC).
+    Rdtsc,
+    /// Guest MSR read trapped to userspace via KVM_CAP_X86_USER_SPACE_MSR.
+    MsrRead,
+    /// Guest MSR write trapped to userspace via KVM_CAP_X86_USER_SPACE_MSR.
+    MsrWrite,
+    /// IRQ injection observed at a userspace device → guest delivery point.
+    /// Recorded for divergence diagnostics; not yet replayed (replay would
+    /// require instruction-position pinning via PMU).
+    IrqInjection,
 }
 
 impl DetExitKind {
@@ -43,6 +104,11 @@ impl DetExitKind {
             Self::MmioWrite => 1,
             Self::IoIn => 2,
             Self::IoOut => 3,
+            Self::VmClockState => 4,
+            Self::Rdtsc => 5,
+            Self::MsrRead => 6,
+            Self::MsrWrite => 7,
+            Self::IrqInjection => 8,
         }
     }
 
@@ -52,8 +118,17 @@ impl DetExitKind {
             1 => Ok(Self::MmioWrite),
             2 => Ok(Self::IoIn),
             3 => Ok(Self::IoOut),
+            4 => Ok(Self::VmClockState),
+            5 => Ok(Self::Rdtsc),
+            6 => Ok(Self::MsrRead),
+            7 => Ok(Self::MsrWrite),
+            8 => Ok(Self::IrqInjection),
             _ => Err(ReplayLogError::InvalidExitKind(value)),
         }
+    }
+
+    fn is_diagnostic_only(self) -> bool {
+        matches!(self, Self::IrqInjection)
     }
 }
 
@@ -72,6 +147,39 @@ pub struct DetExitEvent {
     pub data: Vec<u8>,
 }
 
+const IRQ_DIAGNOSTIC_HISTORY_LEN: usize = 4;
+
+/// Diagnostic context carried on replay divergence: the most recent IRQ
+/// observability events seen in the recorded stream before the mismatch point.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecentIrqEvents(pub Vec<DetExitEvent>);
+
+impl fmt::Display for RecentIrqEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, "no recent IRQs");
+        }
+
+        write!(f, "recent IRQs [")?;
+        for (idx, event) in self.0.iter().enumerate() {
+            if idx != 0 {
+                write!(f, ", ")?;
+            }
+
+            let payload = match event.data.as_slice() {
+                [a, b, c, d] => u32::from_le_bytes([*a, *b, *c, *d]),
+                _ => 0,
+            };
+            write!(
+                f,
+                "#{} src={} payload=0x{:08x}",
+                event.seqno, event.addr, payload
+            )?;
+        }
+        write!(f, "]")
+    }
+}
+
 /// Error returned when a replayed event does not match the expected stream.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayDivergence {
@@ -84,7 +192,7 @@ pub enum ReplayDivergence {
     /// Replay divergence at seqno {seqno}: expected {expected_kind:?} @ {expected_addr:#x}, got {actual_kind:?} @ {actual_addr:#x}
     #[error(
         "Replay divergence at seqno {seqno}: expected {expected_kind:?} @ {expected_addr:#x}, \
-         got {actual_kind:?} @ {actual_addr:#x}"
+         got {actual_kind:?} @ {actual_addr:#x}; {recent_irqs}"
     )]
     KindOrAddrMismatch {
         /// Sequence number of the diverging event.
@@ -97,6 +205,8 @@ pub enum ReplayDivergence {
         actual_kind: DetExitKind,
         /// Bus address observed during replay.
         actual_addr: u64,
+        /// Recent IRQ observability events preceding the mismatch.
+        recent_irqs: RecentIrqEvents,
     },
     /// Replay divergence at seqno {seqno}: size mismatch, expected {expected_size}, got {actual_size}
     #[error(
@@ -196,6 +306,40 @@ impl ReplayController {
         METRICS.replay.events_recorded.inc();
     }
 
+    /// Record a guest TSC read value if recording is enabled.
+    pub fn record_rdtsc(&self, value: u64) {
+        self.record(DetExitKind::Rdtsc, 0, &value.to_le_bytes());
+    }
+
+    /// Record a guest MSR read trapped to userspace.
+    ///
+    /// `msr_index` is stored as the event address; `value` is what was returned to the guest.
+    pub fn record_msr_read(&self, msr_index: u32, value: u64) {
+        self.record(DetExitKind::MsrRead, u64::from(msr_index), &value.to_le_bytes());
+    }
+
+    /// Record a guest MSR write trapped to userspace.
+    pub fn record_msr_write(&self, msr_index: u32, value: u64) {
+        self.record(DetExitKind::MsrWrite, u64::from(msr_index), &value.to_le_bytes());
+    }
+
+    /// Record an IRQ injection observed at a userspace device → guest delivery point.
+    ///
+    /// `source_tag` distinguishes the injection path (`IRQ_SOURCE_LEGACY`,
+    /// `IRQ_SOURCE_VIRTIO_VRING`, etc.). `payload` is a 32-bit per-source summary used
+    /// only for diagnostics; for legacy devices it is typically zero, for virtio it
+    /// carries the `irq_status` bits.
+    ///
+    /// IRQ events are recorded for divergence diagnostics; replay does not yet
+    /// re-inject interrupts at instruction-precise positions.
+    pub fn record_irq(&self, source_tag: u8, payload: u32) {
+        self.record(
+            DetExitKind::IrqInjection,
+            u64::from(source_tag),
+            &payload.to_le_bytes(),
+        );
+    }
+
     /// Return a snapshot of the recorded event log.
     pub fn snapshot(&self) -> Vec<DetExitEvent> {
         self.events
@@ -283,6 +427,36 @@ impl ReplayController {
         Ok(())
     }
 
+    fn recent_irq_events(events: &[DetExitEvent], upto_seqno: u64) -> RecentIrqEvents {
+        let mut recent = events
+            .iter()
+            .take(upto_seqno as usize)
+            .rev()
+            .filter(|event| event.kind == DetExitKind::IrqInjection)
+            .take(IRQ_DIAGNOSTIC_HISTORY_LEN)
+            .cloned()
+            .collect::<Vec<_>>();
+        recent.reverse();
+        RecentIrqEvents(recent)
+    }
+
+    fn next_replay_event(&self) -> Result<(u64, DetExitEvent, RecentIrqEvents), ReplayDivergence> {
+        let events = self.events.lock().expect("Replay events lock poisoned");
+        let mut seqno = self.replay_cursor.load(Ordering::SeqCst);
+
+        while let Some(event) = events.get(seqno as usize) {
+            if !event.kind.is_diagnostic_only() {
+                let recent_irqs = Self::recent_irq_events(&events, seqno);
+                self.replay_cursor.store(seqno + 1, Ordering::SeqCst);
+                return Ok((seqno, event.clone(), recent_irqs));
+            }
+            seqno += 1;
+        }
+
+        self.replay_cursor.store(seqno, Ordering::SeqCst);
+        Err(ReplayDivergence::LogExhausted { seqno })
+    }
+
     /// Consume the next event during replay and fill `data` with the logged bytes.
     ///
     /// Validates that the expected kind and address match, then copies the logged data into the
@@ -293,11 +467,8 @@ impl ReplayController {
         addr: u64,
         data: &mut [u8],
     ) -> Result<(), ReplayDivergence> {
-        let seqno = self.replay_cursor.fetch_add(1, Ordering::SeqCst);
-        let events = self.events.lock().expect("Replay events lock poisoned");
-        let expected = events.get(seqno as usize).ok_or_else(|| {
+        let (seqno, expected, recent_irqs) = self.next_replay_event().inspect_err(|_| {
             METRICS.replay.divergences.inc();
-            ReplayDivergence::LogExhausted { seqno }
         })?;
 
         if expected.kind != kind || expected.addr != addr {
@@ -308,6 +479,7 @@ impl ReplayController {
                 expected_addr: expected.addr,
                 actual_kind: kind,
                 actual_addr: addr,
+                recent_irqs,
             });
         }
 
@@ -336,11 +508,8 @@ impl ReplayController {
         addr: u64,
         data: &[u8],
     ) -> Result<(), ReplayDivergence> {
-        let seqno = self.replay_cursor.fetch_add(1, Ordering::SeqCst);
-        let events = self.events.lock().expect("Replay events lock poisoned");
-        let expected = events.get(seqno as usize).ok_or_else(|| {
+        let (seqno, expected, recent_irqs) = self.next_replay_event().inspect_err(|_| {
             METRICS.replay.divergences.inc();
-            ReplayDivergence::LogExhausted { seqno }
         })?;
 
         if expected.kind != kind || expected.addr != addr {
@@ -351,6 +520,7 @@ impl ReplayController {
                 expected_addr: expected.addr,
                 actual_kind: kind,
                 actual_addr: addr,
+                recent_irqs,
             });
         }
 
@@ -361,6 +531,13 @@ impl ReplayController {
 
         METRICS.replay.events_replayed.inc();
         Ok(())
+    }
+
+    /// Consume the next replay event as a guest TSC read value.
+    pub fn consume_rdtsc(&self) -> Result<u64, ReplayDivergence> {
+        let mut buf = [0_u8; 8];
+        self.consume_read(DetExitKind::Rdtsc, 0, &mut buf)?;
+        Ok(u64::from_le_bytes(buf))
     }
 }
 
@@ -488,13 +665,146 @@ mod tests {
         let mut buf = Vec::new();
 
         controller.record(DetExitKind::MmioRead, 0x10, &[1, 2]);
+        controller.record_rdtsc(0x1122_3344_5566_7788);
         controller.record(DetExitKind::IoOut, 0x20, &[3, 4, 5]);
+        controller.record_msr_read(0x10, 0xAABB_CCDD_EEFF_0011);
+        controller.record_msr_write(0x4b56_4d01, 0xDEAD_BEEF_CAFE_F00D);
         controller.save_to_writer(&mut buf).unwrap();
 
         let loaded = ReplayController::new(ReplayMode::Off);
         loaded.load_from_reader(&mut Cursor::new(buf)).unwrap();
 
         assert_eq!(loaded.snapshot(), controller.snapshot());
+    }
+
+    #[test]
+    fn test_consume_msr_read_returns_logged_value() {
+        const MSR_IA32_TSC: u32 = 0x10;
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_msr_read(MSR_IA32_TSC, 0xAABB_CCDD_EEFF_0011);
+        controller.set_mode(ReplayMode::Replay);
+
+        let mut buf = [0_u8; 8];
+        controller
+            .consume_read(DetExitKind::MsrRead, u64::from(MSR_IA32_TSC), &mut buf)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(buf), 0xAABB_CCDD_EEFF_0011);
+    }
+
+    #[test]
+    fn test_consume_msr_read_diverges_on_index_mismatch() {
+        const MSR_IA32_TSC: u32 = 0x10;
+        const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_msr_read(MSR_IA32_TSC, 0x1234);
+        controller.set_mode(ReplayMode::Replay);
+
+        let mut buf = [0_u8; 8];
+        let err = controller
+            .consume_read(
+                DetExitKind::MsrRead,
+                u64::from(MSR_KVM_SYSTEM_TIME_NEW),
+                &mut buf,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            super::ReplayDivergence::KindOrAddrMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_msr_write_diverges_on_data_mismatch() {
+        const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_msr_write(MSR_KVM_SYSTEM_TIME_NEW, 0xDEAD_BEEF);
+        controller.set_mode(ReplayMode::Replay);
+
+        let err = controller
+            .validate_write(
+                DetExitKind::MsrWrite,
+                u64::from(MSR_KVM_SYSTEM_TIME_NEW),
+                &0xCAFE_BABE_u64.to_le_bytes(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            super::ReplayDivergence::WriteDataMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_record_irq_appends_event_in_record_mode() {
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_irq(super::IRQ_SOURCE_LEGACY, 0);
+        controller.record_irq(super::IRQ_SOURCE_VIRTIO_VRING, 0x42);
+
+        let events = controller.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, DetExitKind::IrqInjection);
+        assert_eq!(events[0].addr, u64::from(super::IRQ_SOURCE_LEGACY));
+        assert_eq!(events[1].kind, DetExitKind::IrqInjection);
+        assert_eq!(events[1].addr, u64::from(super::IRQ_SOURCE_VIRTIO_VRING));
+    }
+
+    #[test]
+    fn test_record_irq_is_noop_off_or_replay() {
+        let controller = ReplayController::new(ReplayMode::Off);
+        controller.record_irq(super::IRQ_SOURCE_LEGACY, 0);
+        assert!(controller.snapshot().is_empty());
+
+        controller.set_mode(ReplayMode::Replay);
+        controller.record_irq(super::IRQ_SOURCE_LEGACY, 0);
+        assert!(controller.snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_global_replay_controller_records_via_helper() {
+        // Use a unique-enough state by clearing and reinstalling a controller.
+        super::register_global_replay_controller(None);
+
+        let controller = std::sync::Arc::new(ReplayController::new(ReplayMode::Record));
+        super::register_global_replay_controller(Some(&controller));
+
+        super::record_irq_via_global(super::IRQ_SOURCE_LEGACY, 0);
+        super::record_irq_via_global(super::IRQ_SOURCE_VIRTIO_VRING, 0x01);
+
+        let events = controller.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].addr, u64::from(super::IRQ_SOURCE_LEGACY));
+        assert_eq!(events[1].addr, u64::from(super::IRQ_SOURCE_VIRTIO_VRING));
+
+        super::register_global_replay_controller(None);
+    }
+
+    #[test]
+    fn test_global_replay_controller_is_noop_when_unregistered() {
+        super::register_global_replay_controller(None);
+        // Just shouldn't panic or write anywhere observable.
+        super::record_irq_via_global(super::IRQ_SOURCE_LEGACY, 0);
+    }
+
+    #[test]
+    fn test_consume_rdtsc_returns_logged_value() {
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_rdtsc(0xAABB_CCDD_EEFF_0011);
+        controller.set_mode(ReplayMode::Replay);
+
+        let value = controller.consume_rdtsc().unwrap();
+        assert_eq!(value, 0xAABB_CCDD_EEFF_0011);
+    }
+
+    #[test]
+    fn test_consume_rdtsc_diverges_on_wrong_event_kind() {
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record(DetExitKind::MmioRead, 0x1000, &[1; 8]);
+        controller.set_mode(ReplayMode::Replay);
+
+        let err = controller.consume_rdtsc().unwrap_err();
+        assert!(matches!(
+            err,
+            super::ReplayDivergence::KindOrAddrMismatch { .. }
+        ));
     }
 
     #[test]
@@ -591,6 +901,62 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_kind_mismatch_carries_recent_irq_history() {
+        use super::ReplayDivergence;
+
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_irq(super::IRQ_SOURCE_LEGACY, 0);
+        controller.record_irq(super::IRQ_SOURCE_VIRTIO_VRING, 0x42);
+        controller.record(DetExitKind::MmioRead, 0x1000, &[0x11, 0x22]);
+        controller.set_mode(ReplayMode::Replay);
+
+        let mut buf = [0u8; 2];
+        let err = controller
+            .consume_read(DetExitKind::IoIn, 0x1000, &mut buf)
+            .unwrap_err();
+
+        match err {
+            ReplayDivergence::KindOrAddrMismatch {
+                seqno,
+                expected_kind,
+                recent_irqs,
+                ..
+            } => {
+                assert_eq!(seqno, 2);
+                assert_eq!(expected_kind, DetExitKind::MmioRead);
+                assert_eq!(recent_irqs.0.len(), 2);
+                assert_eq!(recent_irqs.0[0].addr, u64::from(super::IRQ_SOURCE_LEGACY));
+                assert_eq!(
+                    recent_irqs.0[1].addr,
+                    u64::from(super::IRQ_SOURCE_VIRTIO_VRING)
+                );
+            }
+            other => panic!("expected KindOrAddrMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_consume_read_skips_diagnostic_irq_events() {
+        let controller = ReplayController::new(ReplayMode::Record);
+        controller.record_irq(super::IRQ_SOURCE_LEGACY, 0);
+        controller.record(DetExitKind::MmioRead, 0x1000, &[0xAA, 0xBB]);
+        controller.record_irq(super::IRQ_SOURCE_VIRTIO_VRING, 0x42);
+        controller.set_mode(ReplayMode::Replay);
+
+        let mut buf = [0u8; 2];
+        controller
+            .consume_read(DetExitKind::MmioRead, 0x1000, &mut buf)
+            .unwrap();
+        assert_eq!(buf, [0xAA, 0xBB]);
+
+        let mut trailing = [0u8; 1];
+        let err = controller
+            .consume_read(DetExitKind::IoIn, 0x3f8, &mut trailing)
+            .unwrap_err();
+        assert!(matches!(err, super::ReplayDivergence::LogExhausted { seqno: 3 }));
     }
 
     #[test]

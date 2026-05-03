@@ -36,6 +36,7 @@ impl Trigger for EventFdTrigger {
     type E = io::Error;
 
     fn trigger(&self) -> io::Result<()> {
+        crate::replay::record_irq_via_global(crate::replay::IRQ_SOURCE_LEGACY, 0);
         self.write(1)
     }
 }

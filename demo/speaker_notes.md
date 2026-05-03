@@ -1,134 +1,66 @@
-# Deterministic Replay for Firecracker — Speaker Notes
+Deterministic Replay Demo Notes
 
-## Slide 1 — Domain & problem: why this matters
+Goal
 
-**On the slide**
-- Modern serverless runs on microVMs (Firecracker → AWS Lambda, Fargate, Fly.io)
-- Bugs inside microVMs are hard to reproduce
-- Root cause: *nondeterminism* — same program, different runs, different behavior
-- Debugging, post-mortem, and security analysis all need reliable reproduction
+Show the first end-to-end replay proof beyond MMIO/PIO unit tests:
+Firecracker now records and replays guest-visible VMClock state during snapshot restore.
 
-**Speaker notes (~45s)**
-> "Firecracker runs hundreds of millions of untrusted workloads a day. When a Lambda function hits a rare bug, the engineer trying to reproduce it on their laptop can run the exact same code, with the exact same inputs, and get a completely different execution path. That's not because the code is flaky — it's because the VM itself is nondeterministic. Timers, interrupts, device reads — every one of these depends on host-level state that the guest can't see. So we lose bugs. We lose them silently, and when they matter we can't get them back. Deterministic replay is the standard fix: record once, replay arbitrarily many times, get the same execution every time. It's how Mozilla's `rr` made Firefox debuggable. We want the same for microVMs."
+What this demo does not claim
 
----
+- It does not prove that arbitrary guest `clock_gettime()` calls are deterministic yet.
+- It does not prove full concurrent-program replay yet.
+- It does not prove interrupt timing replay yet.
 
-## Slide 2 — Domain-specific challenges
+What it does prove
 
-**On the slide**
-- Every source of nondeterminism crosses the guest/host boundary as a **vCPU exit**
-- Exit types to cover: PIO, MMIO, IRQs, RDTSC, CPUID
-- IRQs are the hardest: delivered at host-chosen instruction boundaries, not guest-chosen
-- Snapshotting must define a common replay origin
-- Performance: recording can't 10× boot time
+- The replay controller can operate at snapshot-restore time, not only in the vCPU run loop.
+- A guest-visible clock-related interface can be recorded and replayed deterministically.
+- Replay mode and replay-log selection can now influence snapshot restore itself.
 
-**Speaker notes (~50s)**
-> "A VM's guest is a black box executing code. The only way nondeterminism leaks in is through the hypervisor boundary — KVM exits control back to the host on specific instructions, and those are the moments external state enters the guest. There are roughly five categories: port I/O, memory-mapped I/O, interrupts, the timestamp counter, and CPUID. Each one is a separate engineering problem. PIO and MMIO are the easiest — they're synchronous request/response, you can tap them cleanly. IRQs are brutally hard because an interrupt arrives *between* guest instructions at a moment the host chose, not the guest, and to replay you need to re-inject it at the *exact same instruction*. That needs hardware performance counters. The other hard part is that replay has to start from a known state — which means pairing replay with a snapshot."
+Demo story
 
----
+1. Boot a tiny one-vCPU VM and create a paused snapshot.
+   This gives us the fixed replay origin.
 
-## Slide 3 — Proposed solution (high level)
+2. Restore that snapshot in `Record` mode.
+   During restore, Firecracker updates the VMClock device and records the exact guest-visible
+   state into the sidecar log.
 
-**On the slide** (diagram)
+3. Save and inspect the replay log.
+   The important thing to point out is the `VMCLOCK` event in the decoded log preview.
 
-```
- RECORD                         REPLAY
- snapshot ──┐                   ┌── snapshot
-            ↓                   ↓
-    ┌── vCPU run ──┐      ┌── vCPU run ──┐
-    │  PIO/MMIO    │      │  PIO/MMIO    │
-    │   exit       │      │   exit       │
-    └──────┬───────┘      └──────┬───────┘
-           │                     │
-     real device            log lookup
-           │                     │
-      data ─┤                data ◄── log
-           ↓                     ↓
-      log ◄── append         vCPU resumes
-```
+4. Restore the exact same snapshot in `Replay` mode with that log.
+   We do not need to resume the guest. If `events_replayed > 0` immediately after restore,
+   replay already consulted the sidecar log at restore time.
 
-- `/replay/mode` toggles Off / Record / Replay
-- Binary sidecar log format: `DET0` magic + ordered event stream
-- Paired with existing Firecracker snapshot machinery
+5. Show the negative proofs.
+   An empty log fails because restore cannot find the expected VMClock event.
+   A tampered log fails because the first event no longer matches the expected restore-time kind.
 
-**Speaker notes (~45s)**
-> "The prototype plugs into the vCPU exit path. In Record mode, when the guest does a port I/O or an MMIO access, the real device services it like normal — we just tap the answer and append it, with a logical clock, to an in-memory log. In Replay mode, the device doesn't run. The guest still executes, but every PIO/MMIO read is answered from the log, and every write is validated against the log. If the guest's behavior drifts from what we recorded — the next exit doesn't match the next log entry — we report divergence and tear the vCPU down. No silent drift. The whole thing is 400 lines of Rust sitting at the KVM exit handler."
+Key lines to emphasize
 
----
+- `events_recorded > 0` after the Record restore:
+  Restore itself produced replayable state.
 
-## Slide 4 — Domain-specific insights
+- `events_replayed > 0` after the Replay restore:
+  Replay happened before the guest resumed.
 
-**On the slide**
-- Nondeterminism has a *finite*, *enumerable* interface — KVM's exit loop
-- **Read / write asymmetry**: reads are *synthesized* from log, writes are *validated* against log
-- Scalar logical clock is sufficient for single-vCPU
-- Snapshot + log are a *pair*; neither is useful alone
-- Divergence detection is a feature, not a failure mode
+- `divergences = 0` on the clean replay:
+  The logged restore-time VMClock state matched.
 
-**Speaker notes (~60s)**
-> "Four insights shaped the design. First: you don't have to go hunting for nondeterminism. KVM already enumerates every exit — five categories, a handful of opcodes each — so the scope is finite. We attack it one exit type at a time. Second: reads and writes aren't symmetric. A read pulls nondeterministic data *into* the guest. A write doesn't — the guest wrote what the guest wrote. So replay fabricates reads from the log, but for writes it just checks the guest produced the right bytes. That turns the write path into a *verification* of determinism, which is what gives us divergence detection for free. Third: with a single vCPU, there's nothing concurrent about the exits — a scalar counter is enough to order them. We don't need vector clocks until multi-core. Fourth: we didn't build replay-origin infrastructure from scratch. Firecracker already snapshots VMs. We just insist that a replay run load the same snapshot the recording started from."
+- Snapshot-load failure with empty or tampered log:
+  Replay is actively consulting the log, not ignoring it.
 
----
+Why this matters to the larger project
 
-## Slide 5 — Preliminary results (demo slide)
+- MMIO/PIO replay proved the run-loop path.
+- VMClock replay proves the restore-time guest-visible-state path.
+- Together they form the pattern we need for broader deterministic replay:
+  some nondeterminism appears during execution, and some appears while reconstructing guest state.
 
-**On the slide**
-- Three-phase demo: Record → Replay → Proofs
-- Metrics captured per run:
-  - `events_recorded` — how many exits the tap saw
-  - `events_replayed` — how many exits the replay controller serviced
-  - `divergences` — how many times the guest drifted
-- Empty-log test: divergence on *first* exit
-- Tampered-log test: one-byte edit changes replay outcome
+Reasonable Q&A answer
 
-**Speaker notes / live demo (~2 min)**
-> "I'll step through the demo quickly.
->
-> **[Phase A]** We boot Firecracker with a tiny guest that prints seven lines to the serial console. We pause mid-boot, take a snapshot — this is our replay origin — turn on Record, resume for three seconds, pause, save the log. The log is ~1 KB of binary events, each one a PIO or MMIO access the kernel made during boot.
->
-> **[Phase B]** Kill Firecracker. Start a fresh one. Restore the *same* snapshot. Load the log. Turn on Replay. Resume.
->
-> What you see: Firecracker's console prints `hello from the guest` — because the guest re-executed `puts`, its writes matched the log, and they were forwarded to the real UART. Metrics show events_replayed going up. Then, at about 50 events in, IRQ timing drifts from what was recorded — the next exit no longer matches the log — divergence, tear-down.
->
-> **[Proofs]** To prove replay is actually consulting the log and not just passing through: first, replay with an *empty* log diverges on the first exit, not event 50. Second, if we flip one byte of the saved log and re-replay, the events_replayed count changes. Same snapshot, same Firecracker, one byte different in the log — completely different outcome. That's the byte-level evidence that the log is driving replay."
+If someone asks whether this means application time syscalls are deterministic now:
 
----
-
-## Slide 6 — What was unexpectedly hard
-
-**On the slide**
-- IRQ timing replay (gave up for v1) — needs `perf_event` instruction counting
-- Firecracker device model is *too minimal* for a good non-determinism showcase
-- Test-artifact infrastructure was a rabbit hole
-- Writing the log serialization was easy; deciding *what* to record was the hard part
-
-**Speaker notes (~45s)**
-> "A few things that didn't go as planned.
->
-> IRQ replay is where I hit the wall. To pin an interrupt to the right instruction, you need to count retired instructions between the snapshot and the delivery point — that means wiring a hardware perf counter into the KVM run loop and steering the vCPU to break at the exact count. It's a real engineering project, not a weekend. So v1 controls PIO/MMIO only, and accepts IRQ drift as the expected divergence source.
->
-> Second: Firecracker's device model is so trimmed down that I couldn't easily demo replay *reproducing* a non-deterministic value from userspace. Most legacy I/O ports return stubs. You can see determinism in metrics, but showing `record-run prints 0x60, fresh run prints 0x68, replay prints 0x60` requires either modifying the guest to poke a virtio register or driving MMIO manually. I have a path but didn't get there.
->
-> Third: the Firecracker integration-test harness expects downloaded CI artifacts plus jailer plus networking. I burned a few hours trying to make tests run before giving up and writing a pure shell demo against my own kernel and a custom initrd. The shell script turned out to be more useful for presenting anyway."
-
----
-
-## Slide 7 — What's next
-
-**On the slide**
-- IRQ replay via `perf_event` instruction counting
-- TSC offset control (record RDTSC values, replay via MSR intercept)
-- Full Phase 5 tests (record/replay equivalence, not just metric-level)
-- Upstream: move `replay.rs` behind a feature flag, land integration tests
-
-**Speaker notes (~20s)**
-> "The next milestone is IRQ pinning, which unlocks byte-for-byte guest output equivalence. Once that lands, the Phase 5 tests go from 'metric says this worked' to 'the guest produces the exact same bytes twice.' That's the actual deliverable for real-world debuggability."
-
----
-
-## Timing / delivery tips
-
-- Slides 1–4: talk at a steady clip, no demo — maybe 3 minutes total.
-- Slide 5 is the heavy one. Run `./demo/run.sh` in a pre-staged terminal; most section transitions are `[enter to continue]`, so pacing is in your hands. Budget 2–3 minutes.
-- Slide 6 is your opportunity to show self-awareness — it's the single highest-signal slide for audience trust. Don't skip it.
-- If you get a "why not just snapshot and restore instead of recording?" question, the answer is: snapshots give you *one* state; replay gives you a *trajectory*. Debugging a race condition means stepping through the trajectory that led to the bad state, not just observing it.
+"Not yet. This is a stepping stone. We now control one guest-visible clock-related interface at
+restore time. The next step is to target the actual guest clock source used by Linux time APIs."

@@ -1330,6 +1330,8 @@ mod tests {
                 resume_vm: false,
                 network_overrides: vec![],
                 vsock_override: None,
+                replay_mode: ReplayMode::Off,
+                replay_log_path: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

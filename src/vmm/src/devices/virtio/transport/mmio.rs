@@ -468,6 +468,12 @@ impl IrqTrigger {
         };
         self.irq_status.fetch_or(irq, Ordering::SeqCst);
 
+        let source_tag = match irq_type {
+            IrqType::Config => crate::replay::IRQ_SOURCE_VIRTIO_CONFIG,
+            IrqType::Vring => crate::replay::IRQ_SOURCE_VIRTIO_VRING,
+        };
+        crate::replay::record_irq_via_global(source_tag, irq);
+
         self.irq_evt.write(1).map_err(|err| {
             error!("Failed to send irq to the guest: {:?}", err);
             err

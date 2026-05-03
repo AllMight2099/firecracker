@@ -477,6 +477,7 @@ pub enum DeviceManagerPersistError {
 pub struct DeviceRestoreArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: &'a Arc<Vm>,
+    pub replay_controller: &'a Arc<crate::replay::ReplayController>,
     pub event_manager: &'a mut EventManager,
     pub vcpus_exit_evt: &'a EventFd,
     pub vm_resources: &'a mut VmResources,
@@ -532,7 +533,13 @@ impl<'a> Persist<'a> for DeviceManager {
             .map_err(DeviceManagerPersistError::MmioRestore)?;
 
         // Restore ACPI devices
-        let acpi_devices = ACPIDeviceManager::restore(constructor_args.vm, &state.acpi_state)?;
+        let acpi_devices = ACPIDeviceManager::restore(
+            acpi::ACPIDeviceManagerConstructorArgs {
+                vm: constructor_args.vm,
+                replay_controller: Some(constructor_args.replay_controller),
+            },
+            &state.acpi_state,
+        )?;
 
         // Restore PCI devices
         let pci_ctor_args = PciDevicesConstructorArgs {

@@ -5,11 +5,35 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2,
+    KVM_CAP_X86_USER_SPACE_MSR, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+    KVM_IRQCHIP_PIC_SLAVE, KVM_MSR_FILTER_DEFAULT_ALLOW, KVM_MSR_FILTER_MAX_BITMAP_SIZE,
+    KVM_MSR_FILTER_READ, KVM_MSR_FILTER_WRITE, KVM_PIT_SPEAKER_DUMMY, MsrList, kvm_clock_data,
+    kvm_enable_cap, kvm_irqchip, kvm_msr_filter, kvm_msr_filter_range, kvm_pit_config,
+    kvm_pit_state2,
 };
 use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
+use vmm_sys_util::ioctl::ioctl_with_ref;
+
+// Raw ioctl wrapper for KVM_X86_SET_MSR_FILTER (Linux KVM ABI: _IOW(KVMIO=0xAE, 0xc6, kvm_msr_filter)).
+// kvm-ioctls 0.24 does not expose this ioctl; we declare it here.
+#[allow(missing_docs)]
+mod msr_filter_ioctl {
+    use kvm_bindings::kvm_msr_filter;
+    use vmm_sys_util::ioctl_iow_nr;
+    const KVMIO: u32 = 0xAE;
+    ioctl_iow_nr!(KVM_X86_SET_MSR_FILTER, KVMIO, 0xc6, kvm_msr_filter);
+}
+use msr_filter_ioctl::KVM_X86_SET_MSR_FILTER;
+
+// KVM_CAP_X86_USER_SPACE_MSR exit-reason flags (defined in linux/kvm.h, not re-exported by
+// kvm-bindings as Rust constants, only as u32 values for the `args[0]` field).
+/// Forward MSRs unknown to KVM to userspace.
+pub const KVM_MSR_EXIT_REASON_UNKNOWN: u64 = 1 << 0;
+/// Forward accesses to invalid MSRs (or reserved bits) to userspace.
+pub const KVM_MSR_EXIT_REASON_INVAL: u64 = 1 << 1;
+/// Forward accesses to MSRs covered by an active filter to userspace.
+pub const KVM_MSR_EXIT_REASON_FILTER: u64 = 1 << 2;
 
 use crate::arch::x86_64::msr::MsrError;
 use crate::snapshot::Persist;
@@ -48,6 +72,12 @@ pub enum ArchVmError {
     GetMsrsToSave(MsrError),
     /// Failed during KVM_SET_TSS_ADDRESS: {0}
     SetTssAddress(kvm_ioctls::Error),
+    /// Failed to enable KVM_CAP_X86_USER_SPACE_MSR: {0}
+    EnableUserSpaceMsr(kvm_ioctls::Error),
+    /// MSR filter request exceeds KVM_MSR_FILTER_MAX_RANGES (16)
+    MsrFilterTooManyRanges,
+    /// KVM_X86_SET_MSR_FILTER ioctl failed: {0}
+    SetMsrFilter(kvm_ioctls::Error),
 }
 
 /// Structure representing the current architecture's understand of what a "virtual machine" is.
@@ -214,6 +244,68 @@ impl ArchVm {
     /// Gets the size (in bytes) of the `kvm_xsave` struct.
     pub fn xsave2_size(&self) -> Option<usize> {
         self.xsave2_size
+    }
+
+    /// Enable forwarding of MSR accesses to userspace via `VcpuExit::X86Rdmsr`/`X86Wrmsr`.
+    ///
+    /// `exit_reasons` is a bitmask combining `KVM_MSR_EXIT_REASON_*` constants. For replay
+    /// we use `KVM_MSR_EXIT_REASON_FILTER` so only MSRs covered by an active filter trap
+    /// to userspace; other MSRs continue to be emulated by KVM at full speed.
+    ///
+    /// Must be called before any vCPU has run.
+    pub fn enable_user_space_msr(&self, exit_reasons: u64) -> Result<(), ArchVmError> {
+        let cap = kvm_enable_cap {
+            cap: KVM_CAP_X86_USER_SPACE_MSR,
+            args: [exit_reasons, 0, 0, 0],
+            ..Default::default()
+        };
+        self.fd()
+            .enable_cap(&cap)
+            .map_err(ArchVmError::EnableUserSpaceMsr)
+    }
+
+    /// Configure `KVM_X86_SET_MSR_FILTER` so the listed MSRs are forwarded to userspace
+    /// on read and write while all other MSRs continue to be emulated by KVM normally.
+    ///
+    /// This is the userspace-side counterpart to [`enable_user_space_msr`]; both must be
+    /// active for an MSR access to actually surface as a `VcpuExit::X86Rdmsr`/`X86Wrmsr`.
+    pub fn set_replay_msr_filter(&self, msr_indices: &[u32]) -> Result<(), ArchVmError> {
+        if msr_indices.len() > KVM_MSR_FILTER_MAX_BITMAP_SIZE as usize {
+            return Err(ArchVmError::MsrFilterTooManyRanges);
+        }
+        if msr_indices.len() > kvm_bindings::KVM_MSR_FILTER_MAX_RANGES as usize {
+            return Err(ArchVmError::MsrFilterTooManyRanges);
+        }
+
+        // One range per MSR. Each range has a 1-byte bitmap with bit 0 set to mark "filter
+        // this single MSR." The bitmaps must remain alive for the duration of the ioctl,
+        // so we keep them in a stack-frame-owned Vec and store raw pointers into the filter.
+        let mut bitmaps: Vec<u8> = vec![0x01; msr_indices.len()];
+        let mut filter = kvm_msr_filter {
+            flags: KVM_MSR_FILTER_DEFAULT_ALLOW,
+            ranges: [kvm_msr_filter_range::default(); 16],
+        };
+        for (slot, (idx, bitmap_byte)) in msr_indices.iter().zip(bitmaps.iter_mut()).enumerate() {
+            filter.ranges[slot] = kvm_msr_filter_range {
+                flags: KVM_MSR_FILTER_READ | KVM_MSR_FILTER_WRITE,
+                nmsrs: 1,
+                base: *idx,
+                bitmap: bitmap_byte as *mut u8,
+            };
+        }
+
+        // SAFETY: KVM reads `filter` and the bitmap pointers it contains for the duration
+        // of the ioctl. Both `filter` and `bitmaps` outlive the call.
+        let ret = unsafe { ioctl_with_ref(self.fd(), KVM_X86_SET_MSR_FILTER(), &filter) };
+        // Keep `bitmaps` alive past the ioctl point (the loop above borrows from it).
+        drop(bitmaps);
+        if ret < 0 {
+            Err(ArchVmError::SetMsrFilter(
+                vmm_sys_util::errno::Error::last(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 

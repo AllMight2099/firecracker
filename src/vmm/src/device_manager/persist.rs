@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-use super::acpi::ACPIDeviceManager;
+use super::acpi::{ACPIDeviceManager, ACPIDeviceManagerConstructorArgs};
 use super::mmio::*;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::DeviceType;
@@ -126,7 +126,7 @@ pub struct ACPIDeviceManagerState {
 
 impl<'a> Persist<'a> for ACPIDeviceManager {
     type State = ACPIDeviceManagerState;
-    type ConstructorArgs = &'a Vm;
+    type ConstructorArgs = ACPIDeviceManagerConstructorArgs<'a>;
     type Error = ACPIDeviceError;
 
     fn save(&self) -> Self::State {
@@ -136,7 +136,10 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
         }
     }
 
-    fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+    fn restore(
+        constructor_args: Self::ConstructorArgs,
+        state: &Self::State,
+    ) -> Result<Self, Self::Error> {
         let mut acpi_devices = ACPIDeviceManager::new(
             // Safe to unwrap() here, this will never return an error.
             VmGenId::restore((), &state.vmgenid).unwrap(),
@@ -144,11 +147,14 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
             VmClock::restore((), &state.vmclock).unwrap(),
         );
 
-        acpi_devices.activate_vmgenid(vm)?;
+        acpi_devices.activate_vmgenid(constructor_args.vm)?;
         acpi_devices.do_post_restore_vmgenid()?;
 
-        acpi_devices.activate_vmclock(vm)?;
-        acpi_devices.do_post_restore_vmclock(vm.guest_memory())?;
+        acpi_devices.activate_vmclock(constructor_args.vm)?;
+        acpi_devices.do_post_restore_vmclock(
+            constructor_args.vm.guest_memory(),
+            constructor_args.replay_controller,
+        )?;
 
         Ok(acpi_devices)
     }

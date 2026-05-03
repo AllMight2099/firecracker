@@ -9,6 +9,8 @@ use std::path::PathBuf;
 pub use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use crate::replay::ReplayMode;
+
 /// The snapshot type options that are available when
 /// creating a new snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -81,6 +83,10 @@ pub struct LoadSnapshotParams {
     pub network_overrides: Vec<NetworkOverride>,
     /// When set, the vsock backend UDS path will be overridden
     pub vsock_override: Option<VsockOverride>,
+    /// Replay mode to apply before restore-time guest-visible clock updates.
+    pub replay_mode: ReplayMode,
+    /// Optional sidecar replay log to preload before restore-time replay begins.
+    pub replay_log_path: Option<PathBuf>,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -113,6 +119,12 @@ pub struct LoadSnapshotConfig {
     /// Whether or not to override the vsock backend UDS path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// Replay mode to apply before restore-time guest-visible clock updates.
+    #[serde(default)]
+    pub replay_mode: ReplayMode,
+    /// Optional sidecar replay log to preload before restore-time replay begins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_log_path: Option<PathBuf>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

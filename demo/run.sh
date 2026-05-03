@@ -1,44 +1,60 @@
 #!/usr/bin/env bash
-# Deterministic replay live demo.
+# Guest-visible clock deterministic replay demo.
 #
-# Phase A — record: boot a single-vCPU microVM, pause, snapshot, resume under
-# Record mode, capture MMIO/PIO exits, save the sidecar log, kill firecracker.
+# This demo proves a narrower claim than "all guest time queries are deterministic":
+# Firecracker now records and replays the guest-visible VMClock state exposed during
+# snapshot restore. We show that by:
+#   1. creating a snapshot origin,
+#   2. restoring it in Record mode to capture the VMClock update,
+#   3. restoring the same snapshot in Replay mode with the saved log, and
+#   4. showing that replay succeeds before the guest is even resumed.
 #
-# Phase B — replay: start a fresh firecracker, restore the snapshot, load the
-# log, set Replay mode, resume. Metrics prove events are consumed (and, once
-# interrupt timing drifts, divergence is reported).
-#
-# Each stage pauses for input so you can narrate or inspect state.
+# The script also includes two negative proofs:
+#   - a valid but empty replay log fails at restore time,
+#   - a tampered first event fails at restore time.
 
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-FC_BIN="$REPO/build/cargo_target/x86_64-unknown-linux-musl/release/firecracker"
+FC_BIN="$REPO/build/cargo_target/x86_64-unknown-linux-musl/debug/firecracker"
 KERNEL="$REPO/demo/vmlinux-6.1.155"
 INITRD="$REPO/demo/initrd.cpio"
 SOCK=/tmp/fc-demo.sock
 LOG=/tmp/replay.detlog
+EMPTY_LOG=/tmp/replay-empty.detlog
+TAMPERED_LOG=/tmp/replay-tampered.detlog
 SNAP_VMSTATE=/tmp/fc-demo.vmstate
 SNAP_MEM=/tmp/fc-demo.mem
-FC_LOG_REC=/tmp/fc-demo-record.log
-FC_LOG_REP_CLEAN=/tmp/fc-demo-replay-clean.log
-FC_LOG_REP_EMPTY=/tmp/fc-demo-replay-empty.log
-FC_LOG_REP_TAMPER=/tmp/fc-demo-replay-tamper.log
-FC_LOG=                               # set per-phase before launch_firecracker
 METRICS=/tmp/fc-demo.metrics
+FC_LOG_BASE=/tmp/fc-demo-base.log
+FC_LOG_REC=/tmp/fc-demo-record.log
+FC_LOG_REP=/tmp/fc-demo-replay.log
+FC_LOG_EMPTY=/tmp/fc-demo-empty.log
+FC_LOG_TAMPER=/tmp/fc-demo-tamper.log
+FC_LOG=
 
-rm -f "$SOCK" "$LOG" "$SNAP_VMSTATE" "$SNAP_MEM" \
-      "$FC_LOG_REC" "$FC_LOG_REP_CLEAN" "$FC_LOG_REP_EMPTY" "$FC_LOG_REP_TAMPER" \
-      "$METRICS"
+rm -f "$SOCK" "$LOG" "$EMPTY_LOG" "$TAMPERED_LOG" "$SNAP_VMSTATE" "$SNAP_MEM" \
+      "$METRICS" "$FC_LOG_BASE" "$FC_LOG_REC" "$FC_LOG_REP" "$FC_LOG_EMPTY" "$FC_LOG_TAMPER"
 : > "$METRICS"
 
-[[ -f "$INITRD" ]] || { echo "missing $INITRD — run demo/build_initrd.sh first" >&2; exit 1; }
+[[ -x "$FC_BIN" ]] || {
+    echo "missing firecracker binary at $FC_BIN" >&2
+    echo "build it first with: tools/devtool build --debug" >&2
+    exit 1
+}
+[[ -f "$INITRD" ]] || {
+    echo "missing $INITRD — run demo/build_initrd.sh first" >&2
+    exit 1
+}
 [[ -r /dev/kvm && -w /dev/kvm ]] || {
     echo "cannot access /dev/kvm — add \$USER to the 'kvm' group:" >&2
     echo "    sudo usermod -aG kvm \$USER && newgrp kvm" >&2
     echo "or re-run this script under 'sg kvm -c ...' / 'sudo ...'" >&2
     exit 1
 }
+
+pause() { echo; read -rp "[enter to continue] " _; }
+section() { printf '\n\033[1;34m=== %s ===\033[0m\n' "$*"; }
 
 api() {
     local method=$1 path=$2 body=${3:-}
@@ -50,29 +66,29 @@ api() {
     fi
     if [[ -n "$body" ]]; then
         curl -sS --unix-socket "$SOCK" -X "$method" "http://localhost$path" \
-             -H "Content-Type: application/json" -d "$body"
+            -H "Content-Type: application/json" -d "$body"
     else
         curl -sS --unix-socket "$SOCK" -X "$method" "http://localhost$path"
     fi
     echo
 }
 
-pause() { echo; read -rp "[enter to continue] " _; }
-
-section() { printf '\n\033[1;34m=== %s ===\033[0m\n' "$*"; }
-
-replay_metrics() {
-    api PUT /actions '{"action_type":"FlushMetrics"}' >/dev/null
-    METRICS="$METRICS" python3 <<'PY'
-import json, os
-path = os.environ["METRICS"]
-with open(path) as f:
-    lines = [l for l in f if l.strip()]
-m = json.loads(lines[-1])["replay"]
-print("  events_recorded =", m["events_recorded"])
-print("  events_replayed =", m["events_replayed"])
-print("  divergences     =", m["divergences"])
-PY
+api_status() {
+    local method=$1 path=$2 body=${3:-}
+    local out http
+    if [[ -n "$body" ]]; then
+        out=$(mktemp)
+        http=$(curl -sS --unix-socket "$SOCK" -o "$out" -w '%{http_code}' -X "$method" \
+            "http://localhost$path" -H "Content-Type: application/json" -d "$body")
+    else
+        out=$(mktemp)
+        http=$(curl -sS --unix-socket "$SOCK" -o "$out" -w '%{http_code}' -X "$method" \
+            "http://localhost$path")
+    fi
+    cat "$out"
+    rm -f "$out"
+    echo
+    echo "http_status=$http"
 }
 
 launch_firecracker() {
@@ -96,200 +112,199 @@ kill_firecracker() {
 cleanup() { kill_firecracker; rm -f "$SOCK"; }
 trap cleanup EXIT
 
-###############################################################################
-# Phase A — record
-###############################################################################
-
-section "1. Launch firecracker (record instance)"
-FC_LOG="$FC_LOG_REC"
-launch_firecracker
-pause
-
-section "2. Configure VM (1 vCPU, 128 MiB, kernel + initrd, metrics sink)"
-api PUT /boot-source    "{\"kernel_image_path\":\"$KERNEL\",\"initrd_path\":\"$INITRD\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off quiet\"}"
-api PUT /machine-config '{"vcpu_count":1,"mem_size_mib":128}'
-api PUT /metrics        "{\"metrics_path\":\"$METRICS\"}"
-pause
-
-section "3. Start VM, pause, take snapshot (this is the replay origin)"
-api PUT   /actions         '{"action_type":"InstanceStart"}'
-sleep 0.2
-api PATCH /vm              '{"state":"Paused"}'
-api PUT   /snapshot/create "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_file_path\":\"$SNAP_MEM\"}"
-ls -la "$SNAP_VMSTATE" "$SNAP_MEM"
-pause
-
-section "4. Enter Record, resume guest for ~3s, save log, kill firecracker"
-api PUT   /replay/mode '{"mode":"Record"}'
-api PATCH /vm          '{"state":"Resumed"}'
-sleep 3
-api PATCH /vm          '{"state":"Paused"}'
-api PUT   /replay/mode '{"mode":"Off"}'
-api PUT   /replay/save "{\"path\":\"$LOG\"}"
-echo
-echo "Guest serial output captured while recording:"
-grep -a "det-replay demo" "$FC_LOG" || true
-echo
-echo "Sidecar log on disk:"
-ls -la "$LOG"
-echo
-echo "Replay metrics after Record:"
-replay_metrics
-kill_firecracker
-pause
-
-###############################################################################
-# Phase B — replay
-###############################################################################
-
-section "5. Launch fresh firecracker (replay instance)"
-FC_LOG="$FC_LOG_REP_CLEAN"
-launch_firecracker
-pause
-
-section "6. Configure metrics, load snapshot, load log, enter Replay mode"
-api PUT /metrics       "{\"metrics_path\":\"$METRICS\"}"
-api PUT /snapshot/load "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false}"
-api PUT /replay/load   "{\"path\":\"$LOG\"}"
-api PUT /replay/mode   '{"mode":"Replay"}'
-api GET /replay/mode
-pause
-
-section "7. Resume under Replay — vCPU consumes events, then diverges"
-api PATCH /vm '{"state":"Resumed"}'
-echo
-echo "Racing FlushMetrics against vCPU teardown..."
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    curl -sS --unix-socket "$SOCK" -X PUT "http://localhost/actions" \
-         -H "Content-Type: application/json" \
-         -d '{"action_type":"FlushMetrics"}' >/dev/null 2>&1 || true
-    sleep 0.1
-    kill -0 "$FC_PID" 2>/dev/null || break
-done
-
-if kill -0 "$FC_PID" 2>/dev/null; then
-    echo "firecracker still alive — no divergence in ~1s"
-else
-    echo "firecracker exited — divergence-triggered vCPU teardown (expected)"
-fi
-FC_PID=  # stop the EXIT trap from trying to kill it again
-
-echo
-echo "Replay metrics (last flushed):"
-METRICS="$METRICS" python3 <<'PY'
-import json, os
-path = os.environ["METRICS"]
-with open(path) as f:
-    lines = [l for l in f if l.strip()]
-if not lines:
-    print("  (no metrics captured)")
-else:
-    m = json.loads(lines[-1])["replay"]
-    print("  events_recorded =", m["events_recorded"])
-    print("  events_replayed =", m["events_replayed"])
-    print("  divergences     =", m["divergences"])
-PY
-
-echo
-echo "Guest output during replay (should start the same way as record):"
-grep -a "det-replay demo" "$FC_LOG" | tail -n 10 || true
-echo
-echo "Reading the numbers:"
-echo "  events_replayed > 0  → vCPU matched PIO/MMIO exits against the log"
-echo "  divergences     > 0  → log/guest drifted (IRQ timing isn't yet controlled)"
-echo "  firecracker exit 1   → divergence tore down the vCPU (expected)"
-pause
-
-###############################################################################
-# Phase C — proofs that replay is actually consulting the log
-###############################################################################
-
-print_replay_metrics() {
+replay_metrics() {
+    api PUT /actions '{"action_type":"FlushMetrics"}' >/dev/null
     METRICS="$METRICS" python3 <<'PY'
 import json, os
 path = os.environ["METRICS"]
 with open(path) as f:
     lines = [l for l in f if l.strip()]
 if not lines:
-    print("  (firecracker died before any FlushMetrics landed — that IS the")
-    print("   proof: on this config the vCPU tore down in well under 100 ms,")
-    print("   which is exactly what 'diverge on first exit' looks like.)")
+    print("  (no metrics flushed yet)")
 else:
     m = json.loads(lines[-1])["replay"]
-    print(f"  events_recorded = {m['events_recorded']}")
-    print(f"  events_replayed = {m['events_replayed']}")
-    print(f"  divergences     = {m['divergences']}")
+    print("  events_recorded =", m["events_recorded"])
+    print("  events_replayed =", m["events_replayed"])
+    print("  divergences     =", m["divergences"])
 PY
 }
 
-race_flush_until_dead() {
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        curl -sS --unix-socket "$SOCK" -X PUT "http://localhost/actions" \
-             -H "Content-Type: application/json" \
-             -d '{"action_type":"FlushMetrics"}' >/dev/null 2>&1 || true
-        sleep 0.1
-        kill -0 "$FC_PID" 2>/dev/null || break
-    done
-    FC_PID=
-}
-
-section "8. Proof A — Replay with an empty log diverges on the FIRST exit"
-echo "Same snapshot, same everything — but no log loaded. If the replay"
-echo "controller weren't actively consulting a log, the guest would just"
-echo "boot. Instead we expect divergences=1, events_replayed=0 (or"
-echo "firecracker dying too fast to flush — which IS the same proof)."
-pause
-: > "$METRICS"
-FC_LOG="$FC_LOG_REP_EMPTY"
-launch_firecracker
-api PUT   /metrics       "{\"metrics_path\":\"$METRICS\"}"
-api PUT   /snapshot/load "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false}"
-# NOTE: intentionally skip /replay/load — controller's event buffer is empty.
-api PUT   /replay/mode   '{"mode":"Replay"}'
-api PATCH /vm            '{"state":"Resumed"}'
-race_flush_until_dead
-echo
-echo "Metrics with empty log:"
-print_replay_metrics
-pause
-
-section "9. Proof B — Tamper with ONE byte of the log, watch divergence move"
-# Log layout: 6-byte header, then events of shape
-#   u64 seqno | u8 kind | u8 pad | u16 pad | u64 addr | u32 size | <data>
-# => the first data byte of event #0 sits at offset 6 + 24 = 30.
-cp "$LOG" "$LOG.tampered"
-python3 - "$LOG.tampered" <<'PY'
+dump_replay_log() {
+    local path=$1
+    local limit=${2:-12}
+    REPLAY_LOG_PATH="$path" REPLAY_LOG_LIMIT="$limit" python3 <<'PY'
+import os
+import struct
 import sys
-path = sys.argv[1]
-with open(path, "r+b") as f:
-    f.seek(30)
-    original = f.read(1)[0]
-    f.seek(30)
-    f.write(bytes([original ^ 0xFF]))
-print(f"flipped byte at offset 30: 0x{original:02x} -> 0x{original ^ 0xFF:02x}")
+
+path = os.environ["REPLAY_LOG_PATH"]
+limit = int(os.environ["REPLAY_LOG_LIMIT"])
+
+kind_names = {
+    0: "MMIO_READ",
+    1: "MMIO_WRITE",
+    2: "PIO_IN",
+    3: "PIO_OUT",
+    4: "VMCLOCK",
+    5: "RDTSC",
+}
+
+def fmt_bytes(buf: bytes) -> str:
+    if not buf:
+        return "-"
+    hexed = " ".join(f"{b:02x}" for b in buf[:8])
+    if len(buf) > 8:
+        hexed += " ..."
+    return hexed
+
+with open(path, "rb") as f:
+    blob = f.read()
+
+if len(blob) < 6 or blob[:4] != b"DET0":
+    print(f"  {path}: not a DET0 replay log", file=sys.stderr)
+    sys.exit(1)
+
+version = struct.unpack_from("<H", blob, 4)[0]
+offset = 6
+events = []
+while offset < len(blob):
+    seqno = struct.unpack_from("<Q", blob, offset)[0]
+    offset += 8
+    kind = blob[offset]
+    offset += 1
+    offset += 3
+    addr = struct.unpack_from("<Q", blob, offset)[0]
+    offset += 8
+    size = struct.unpack_from("<I", blob, offset)[0]
+    offset += 4
+    data = blob[offset:offset + size]
+    offset += size
+    events.append((seqno, kind, addr, size, data))
+
+print(f"  log_version = {version}")
+print(f"  total_events = {len(events)}")
+for seqno, kind, addr, size, data in events[:limit]:
+    print(
+        f"  seq={seqno:03d}  {kind_names.get(kind, f'KIND_{kind}'):<8} "
+        f"addr=0x{addr:x}  size={size:<3} data=[{fmt_bytes(data)}]"
+    )
+if len(events) > limit:
+    print(f"  ... {len(events) - limit} more events not shown")
 PY
-echo
-echo "Replay controller will now see a tampered first event. Either:"
-echo "  - event #0 is a read → guest gets wrong bytes, downstream exits drift"
-echo "  - event #0 is a write → validate_write catches the mismatch immediately"
-echo "Either way, divergence moves versus the clean-log run in section 7."
-pause
-: > "$METRICS"
-FC_LOG="$FC_LOG_REP_TAMPER"
+}
+
+make_empty_replay_log() {
+    python3 - "$1" <<'PY'
+import struct
+import sys
+with open(sys.argv[1], "wb") as f:
+    f.write(b"DET0")
+    f.write(struct.pack("<H", 1))
+PY
+}
+
+tamper_first_event_kind() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "rb") as f:
+    data = bytearray(f.read())
+assert data[:4] == b"DET0"
+kind_offset = 6 + 8
+original = data[kind_offset]
+data[kind_offset] = 2
+with open(dst, "wb") as f:
+    f.write(data)
+print(f"tampered first event kind at offset {kind_offset}: {original} -> {data[kind_offset]}")
+PY
+}
+
+section "1. Boot a baseline VM and create the snapshot origin"
+FC_LOG="$FC_LOG_BASE"
 launch_firecracker
-api PUT   /metrics       "{\"metrics_path\":\"$METRICS\"}"
-api PUT   /snapshot/load "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false}"
-api PUT   /replay/load   "{\"path\":\"$LOG.tampered\"}"
-api PUT   /replay/mode   '{"mode":"Replay"}'
-api PATCH /vm            '{"state":"Resumed"}'
-race_flush_until_dead
-echo
-echo "Metrics with tampered log:"
-print_replay_metrics
-echo
-echo "Compare against section 7's clean-log replay. Different events_replayed"
-echo "count is the smoking gun: the replay controller is byte-for-byte reading"
-echo "log content, not just counting entries."
+api PUT /boot-source \
+    "{\"kernel_image_path\":\"$KERNEL\",\"initrd_path\":\"$INITRD\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off quiet\"}"
+api PUT /machine-config '{"vcpu_count":1,"mem_size_mib":128}'
+api PUT /metrics "{\"metrics_path\":\"$METRICS\"}"
+api PUT /actions '{"action_type":"InstanceStart"}'
+sleep 0.2
+api PATCH /vm '{"state":"Paused"}'
+api PUT /snapshot/create "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_file_path\":\"$SNAP_MEM\"}"
+echo "Snapshot files:"
+ls -la "$SNAP_VMSTATE" "$SNAP_MEM"
+kill_firecracker
 pause
 
-section "done — kill firecracker + clean up"
+section "2. Restore the snapshot in Record mode"
+echo "This is the key new path: replay mode is supplied as part of /snapshot/load,"
+echo "so restore-time VMClock state can be captured before the guest is resumed."
+FC_LOG="$FC_LOG_REC"
+launch_firecracker
+api PUT /metrics "{\"metrics_path\":\"$METRICS\"}"
+api PUT /snapshot/load \
+    "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false,\"replay_mode\":\"Record\"}"
+echo
+echo "Replay metrics immediately after Record restore:"
+replay_metrics
+api PUT /replay/save "{\"path\":\"$LOG\"}"
+echo
+echo "Saved sidecar replay log:"
+ls -la "$LOG"
+echo
+echo "Decoded log preview:"
+dump_replay_log "$LOG" 8
+kill_firecracker
+pause
+
+section "3. Restore the same snapshot in Replay mode with the saved log"
+echo "We have not resumed the guest. Any replayed events here come from restore-time"
+echo "guest-visible state, which is exactly what we wanted to prove for VMClock."
+FC_LOG="$FC_LOG_REP"
+launch_firecracker
+api PUT /metrics "{\"metrics_path\":\"$METRICS\"}"
+api PUT /snapshot/load \
+    "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false,\"replay_mode\":\"Replay\",\"replay_log_path\":\"$LOG\"}"
+echo
+echo "Replay metrics immediately after Replay restore:"
+replay_metrics
+echo
+echo "Reading the numbers:"
+echo "  events_replayed > 0  -> restore-time replay consumed the saved VMClock event"
+echo "  divergences = 0      -> the replay log matched the expected restore-time state"
+kill_firecracker
+pause
+
+section "4. Proof A — a valid but empty replay log fails during snapshot restore"
+make_empty_replay_log "$EMPTY_LOG"
+echo "Empty log created at $EMPTY_LOG"
+FC_LOG="$FC_LOG_EMPTY"
+launch_firecracker
+api PUT /metrics "{\"metrics_path\":\"$METRICS\"}"
+api_status PUT /snapshot/load \
+    "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false,\"replay_mode\":\"Replay\",\"replay_log_path\":\"$EMPTY_LOG\"}"
+echo
+echo "Tail of firecracker log:"
+tail -n 20 "$FC_LOG" || true
+kill_firecracker
+pause
+
+section "5. Proof B — tampering with the first event kind fails during restore"
+tamper_first_event_kind "$LOG" "$TAMPERED_LOG"
+echo
+echo "Tampered log preview:"
+dump_replay_log "$TAMPERED_LOG" 4
+FC_LOG="$FC_LOG_TAMPER"
+launch_firecracker
+api PUT /metrics "{\"metrics_path\":\"$METRICS\"}"
+api_status PUT /snapshot/load \
+    "{\"snapshot_path\":\"$SNAP_VMSTATE\",\"mem_backend\":{\"backend_path\":\"$SNAP_MEM\",\"backend_type\":\"File\"},\"resume_vm\":false,\"replay_mode\":\"Replay\",\"replay_log_path\":\"$TAMPERED_LOG\"}"
+echo
+echo "Tail of firecracker log:"
+tail -n 20 "$FC_LOG" || true
+kill_firecracker
+
+section "Done"
+echo "What this demo proves:"
+echo "  - Firecracker can record restore-time VMClock state into a sidecar replay log."
+echo "  - Firecracker can consume that same VMClock event deterministically on replay."
+echo "  - Replay mode and replay-log path now matter at snapshot-load time, not just after boot."

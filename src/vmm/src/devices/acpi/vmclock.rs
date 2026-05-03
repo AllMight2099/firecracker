@@ -19,6 +19,7 @@ use crate::devices::acpi::generated::vmclock_abi::{
     VMCLOCK_FLAG_VM_GEN_COUNTER_PRESENT, VMCLOCK_MAGIC, VMCLOCK_STATUS_UNKNOWN, vmclock_abi,
 };
 use crate::devices::legacy::EventFdTrigger;
+use crate::replay::{DetExitKind, ReplayController, ReplayDivergence, ReplayMode};
 use crate::snapshot::Persist;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::resources::ResourceAllocator;
@@ -55,6 +56,8 @@ pub enum VmClockError {
     WriteGuestMemory(#[from] GuestMemoryError),
     /// Could not notify guest: {0}
     NotifyGuest(std::io::Error),
+    /// Replay divergence while restoring VMClock: {0}
+    Replay(#[from] ReplayDivergence),
 }
 
 /// VMclock device
@@ -118,7 +121,31 @@ impl VmClock {
     }
 
     /// Bump the VM generation counter and notify guest after snapshot restore
-    pub fn do_post_restore(&mut self, mem: &GuestMemoryMmap) -> Result<(), VmClockError> {
+    pub fn do_post_restore(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        replay_controller: Option<&ReplayController>,
+    ) -> Result<(), VmClockError> {
+        if let Some(replay_controller) = replay_controller {
+            match replay_controller.mode() {
+                ReplayMode::Replay => {
+                    replay_controller.consume_read(
+                        DetExitKind::VmClockState,
+                        self.guest_address.0,
+                        self.inner.as_mut_slice(),
+                    )?;
+                    mem.write_slice(self.inner.as_slice(), self.guest_address)?;
+                    fence(Ordering::Release);
+                    self.interrupt_evt
+                        .trigger()
+                        .map_err(VmClockError::NotifyGuest)?;
+                    debug!("vmclock: replayed guest-visible VMClock state");
+                    return Ok(());
+                }
+                ReplayMode::Off | ReplayMode::Record => {}
+            }
+        }
+
         write_vmclock_field!(self, mem, seq_count, self.inner.seq_count | 1);
 
         // This fence ensures guest sees all previous writes. It is matched to a
@@ -144,6 +171,13 @@ impl VmClock {
         fence(Ordering::Release);
 
         write_vmclock_field!(self, mem, seq_count, self.inner.seq_count.wrapping_add(1));
+        if let Some(replay_controller) = replay_controller {
+            replay_controller.record(
+                DetExitKind::VmClockState,
+                self.guest_address.0,
+                self.inner.as_slice(),
+            );
+        }
         self.interrupt_evt
             .trigger()
             .map_err(VmClockError::NotifyGuest)?;
@@ -222,7 +256,9 @@ impl Aml for VmClock {
 
 #[cfg(test)]
 mod tests {
-    use vm_memory::{Bytes, GuestAddress};
+    use std::sync::Arc;
+
+    use vm_memory::{ByteValued, Bytes, GuestAddress};
     use vmm_sys_util::tempfile::TempFile;
 
     use crate::Vm;
@@ -232,6 +268,7 @@ mod tests {
     use crate::devices::acpi::generated::vmclock_abi::vmclock_abi;
     use crate::devices::acpi::vmclock::{VMCLOCK_SIZE, VmClock};
     use crate::devices::virtio::test_utils::default_mem;
+    use crate::replay::{DetExitKind, ReplayController, ReplayMode};
     use crate::snapshot::{Persist, Snapshot};
     use crate::test_utils::single_region_mem;
     use crate::utils::u64_to_usize;
@@ -276,7 +313,7 @@ mod tests {
 
         let state = vmclock.save();
         let mut vmclock_new = VmClock::restore((), &state).unwrap();
-        vmclock_new.do_post_restore(&mem);
+        vmclock_new.do_post_restore(&mem, None).unwrap();
 
         let guest_data_new: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
         assert_ne!(guest_data_new, vmclock.inner);
@@ -289,5 +326,67 @@ mod tests {
             vmclock.inner.vm_generation_counter + 1,
             vmclock_new.inner.vm_generation_counter
         );
+    }
+
+    #[test]
+    fn test_post_restore_records_vmclock_state() {
+        let vmclock = default_vmclock();
+        let mem = single_region_mem(
+            u64_to_usize(arch::SYSTEM_MEM_START) + u64_to_usize(arch::SYSTEM_MEM_SIZE),
+        );
+        vmclock.activate(&mem).unwrap();
+
+        let state = vmclock.save();
+        let mut restored = VmClock::restore((), &state).unwrap();
+        let replay_controller = Arc::new(ReplayController::new(ReplayMode::Record));
+
+        restored
+            .do_post_restore(&mem, Some(replay_controller.as_ref()))
+            .unwrap();
+
+        let events = replay_controller.snapshot();
+        let guest_data: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, DetExitKind::VmClockState);
+        assert_eq!(events[0].addr, VMCLOCK_TEST_GUEST_ADDR.0);
+        assert_eq!(events[0].data, guest_data.as_slice());
+    }
+
+    #[test]
+    fn test_post_restore_replays_vmclock_state() {
+        let vmclock = default_vmclock();
+        let mem = single_region_mem(
+            u64_to_usize(arch::SYSTEM_MEM_START) + u64_to_usize(arch::SYSTEM_MEM_SIZE),
+        );
+        vmclock.activate(&mem).unwrap();
+
+        let state = vmclock.save();
+        let mut recorded = VmClock::restore((), &state).unwrap();
+        let recorder = Arc::new(ReplayController::new(ReplayMode::Record));
+        recorder.record_irq(crate::replay::IRQ_SOURCE_LEGACY, 0);
+        recorded.do_post_restore(&mem, Some(recorder.as_ref())).unwrap();
+        let recorded_state: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
+
+        let replayer = Arc::new(ReplayController::new(ReplayMode::Off));
+        let mut log = Vec::new();
+        recorder.save_to_writer(&mut log).unwrap();
+        replayer
+            .load_from_reader(&mut std::io::Cursor::new(log))
+            .unwrap();
+        replayer.set_mode(ReplayMode::Replay);
+
+        let replay_mem = single_region_mem(
+            u64_to_usize(arch::SYSTEM_MEM_START) + u64_to_usize(arch::SYSTEM_MEM_SIZE),
+        );
+        let mut replayed = VmClock::restore((), &state).unwrap();
+        replayed.activate(&replay_mem).unwrap();
+        replayed
+            .do_post_restore(&replay_mem, Some(replayer.as_ref()))
+            .unwrap();
+
+        let replayed_state: vmclock_abi = replay_mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
+        assert_eq!(replayed_state, recorded_state);
+        assert_eq!(replayed.inner, recorded_state);
     }
 }
