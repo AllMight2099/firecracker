@@ -18,8 +18,9 @@ tags
 /resources/x86_64
 /resources/aarch64
 *.log
-tmp
+# tmp
 demo/ubuntu-24.04.ext4
 demo/ubuntu-24.04.id_rsa
 demo/vmlinux-6.1.155
 demo/initrd.cpio
+
